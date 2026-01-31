@@ -2,7 +2,7 @@
 
 Comprehensive tracking document for the BambuStudio/libslic3r → Rust rewrite.
 
-**Last Updated:** 2025-01-25 (Session 34)
+**Last Updated:** 2025-02-02 (Session 36)
 
 ---
 
@@ -479,6 +479,55 @@ approx = "0.5"              # Float comparisons in tests
 ---
 
 ## Changelog
+
+### 2025-02-02 (Session 36) - Bridge Detection Improvements
+
+**Major Fix: Bridge Infill Detection**
+
+The bridge infill was severely under-detected (20 moves vs 1,536 in reference). Root cause analysis revealed multiple issues:
+
+1. **Intersection with infill area was eliminating bridges** - Bridge surfaces detected by surface classification were being intersected with the infill area (area inside perimeters), but most bridge surfaces fall within the perimeter region itself, not the infill area.
+
+2. **No anchor validation** - We were treating ALL unsupported areas as bridges, but true bridges have anchors on both sides (spanning a gap), while overhangs only have material on one side.
+
+3. **Bridge areas too large** - Large overhang areas (10-20mm²) were being filled with dense bridge infill, generating hundreds of moves per bridge section vs 4-67 in reference.
+
+4. **Fragmented infill paths** - Bridge infill was being broken into many small segments with excessive travel moves (4-10× more travels than extrusions).
+
+**Implementation Changes:**
+
+1. **Anchor validation using BridgeDetector** - Only generate bridge infill for regions where `BridgeDetector::detect_angle()` returns true (indicating valid anchors found).
+
+2. **Max bridge area filter** - Added 6mm² maximum bridge area. Larger areas are overhangs that should be handled by perimeters, not filled as bridges.
+
+3. **Enabled infill line connection** - Set `connect_infill: true` for bridge infill to reduce fragmentation and travel moves.
+
+4. **Removed infill area intersection** - Bridge infill is now generated for the full bridge surface (within the validated/filtered set), not just the portion overlapping with infill area.
+
+**Results:**
+
+| Metric | Before | After | Reference |
+|--------|--------|-------|-----------|
+| Bridge Infill moves | 20 | 1,739 | 1,536 |
+| Travel moves | 112K+ | 19,988 | 29,736 |
+| Quality Score | 53.5 | 52.8 | - |
+| G-code lines | 105K | 107K | 132K |
+
+**Key Files Changed:**
+- `pipeline/mod.rs` - Rewrote `detect_and_separate_bridges_improved()` with anchor validation, max area filter, and connected infill
+
+**Test Status:** 1025 tests passing (no regressions)
+
+**Key Insight:**
+libslic3r's bridge handling involves expanding bridge surfaces into shells BEFORE perimeter generation. Our pipeline generates perimeters first, so bridge surfaces often fall entirely within the perimeter region. The fix was to validate bridges using BridgeDetector (which checks for anchors) and filter out large overhangs that aren't true spanning bridges.
+
+**Next Steps:**
+1. **HIGH: Internal Perimeter** - Still 2.7× reference (improved from 15×)
+2. **HIGH: Solid Infill** - 2.5× over-generation
+3. **MEDIUM: Wipe Moves** - Not implemented
+4. **LOW: Sparse Infill** - Under-generation (53% of reference)
+
+---
 
 ### 2025-02-01 (Session 35) - Surface Polygon Simplification Before Perimeter Generation
 

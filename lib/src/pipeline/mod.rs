@@ -1090,27 +1090,57 @@ impl PrintPipeline {
             self.config.bridge.min_area * crate::SCALING_FACTOR * crate::SCALING_FACTOR;
 
         // Filter and combine bridge candidates
-        let mut bridge_candidates: ExPolygons = bridge_surfaces
+        let bridge_candidates: ExPolygons = bridge_surfaces
             .into_iter()
             .chain(unsupported.into_iter())
             .filter(|ex| ex.area().abs() >= min_bridge_area)
             .collect();
 
-        // Intersect with actual infill area to get only the parts that will be filled
-        if !bridge_candidates.is_empty() {
-            bridge_candidates = clipper::intersection(&bridge_candidates, &infill_expolygons);
+        // Filter bridge candidates to only those with valid anchors.
+        // A true bridge has anchors on the lower layer (not just an overhang).
+        // This is the key distinction - overhangs only have material on one side,
+        // while bridges span across a gap with anchors on both sides.
+        let spacing = self.config.print.nozzle_diameter * 1.125;
+        let mut validated_bridges: ExPolygons = Vec::new();
+
+        for bridge_expoly in &bridge_candidates {
+            let mut detector =
+                BridgeDetector::new(bridge_expoly.clone(), lower_layer_slices, spacing);
+
+            // Only include bridges that have proper anchors (detect_angle returns true).
+            // Large areas without anchors are overhangs, not bridges - they should be
+            // handled by perimeters (possibly with overhang slowdown), not bridge infill.
+            let has_anchors = detector.detect_angle(0.0);
+
+            if has_anchors {
+                validated_bridges.push(bridge_expoly.clone());
+            }
         }
+
+        // Use validated bridges for infill generation
+        let bridge_candidates = validated_bridges;
 
         if bridge_candidates.is_empty() {
             return (InfillResult::new(), None);
         }
 
         let mut bridge_infill = InfillResult::new();
+        // Use wider spacing for bridges to reduce line count.
+        // libslic3r generates fewer, longer bridge lines rather than many short ones.
         let spacing = self.config.print.nozzle_diameter * 1.125;
 
         // Process each bridge candidate
+        // Maximum bridge area to fill - larger areas are overhangs that get perimeters
+        // True bridges that span gaps are typically small (~1-6 mm²)
+        let max_bridge_area = 6.0 * crate::SCALING_FACTOR * crate::SCALING_FACTOR; // 6 mm²
+
         for bridge_expoly in &bridge_candidates {
-            if bridge_expoly.area().abs() < min_bridge_area {
+            let area = bridge_expoly.area().abs();
+            if area < min_bridge_area {
+                continue;
+            }
+            // Skip overly large "bridges" - these are overhangs, not true spanning bridges
+            if area > max_bridge_area {
                 continue;
             }
 
@@ -1154,15 +1184,17 @@ impl PrintPipeline {
             };
 
             // Generate bridge infill at the optimal angle
+            // Use standard bridge extrusion width (nozzle diameter for circular cross-section)
+            let bridge_extrusion_width = self.config.print.nozzle_diameter;
             let bridge_config = InfillConfig {
                 pattern: InfillPattern::Rectilinear,
                 density: 1.0, // Solid bridge infill
-                extrusion_width: spacing,
+                extrusion_width: bridge_extrusion_width,
                 angle: bridge_angle,
                 angle_increment: 0.0, // Don't rotate bridge infill
-                overlap: 0.15,        // Slightly more overlap for bridges
-                min_area: 0.5,
-                connect_infill: false,
+                overlap: 0.15,        // Standard overlap for bridges
+                min_area: 0.1,        // Small min area for bridges
+                connect_infill: true, // Connect lines to reduce travel moves
                 infill_first: false,
                 z_height: 0.0,
                 layer_height: self.config.print.layer_height,
@@ -1178,6 +1210,7 @@ impl PrintPipeline {
         }
 
         // Calculate remaining non-bridge area
+        // We need to subtract bridge regions from infill area to avoid double-filling
         let remaining = clipper::difference(&infill_expolygons, &bridge_candidates);
 
         if remaining.is_empty() && bridge_infill.paths.is_empty() {
