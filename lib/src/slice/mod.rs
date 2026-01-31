@@ -22,4 +22,7 @@ pub use layer::{Layer, LayerRegion};
 pub use mesh_slicer::{slice_mesh, slice_mesh_at_z};
 pub use slicer::Slicer;
 pub use slicing_params::SlicingParams;
-pub use surface::{Surface, SurfaceType};
+pub use surface::{
+    detect_all_surface_types, detect_surface_types, propagate_solid_infill, Surface,
+    SurfaceCollection, SurfaceDetectionConfig, SurfaceType,
+};

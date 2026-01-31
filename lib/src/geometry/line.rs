@@ -229,6 +229,34 @@ impl Line {
         }
     }
 
+    /// Static method: Calculate the squared distance from a point to a line segment.
+    /// This matches libslic3r's `Line::distance_to_squared()` static method.
+    pub fn distance_to_squared(p: Point, a: Point, b: Point) -> f64 {
+        let line = Line::new(a, b);
+        let proj = p.project_onto_segment(a, b);
+        p.distance_squared(&proj) as f64
+    }
+
+    /// Static method: Calculate the squared distance from a point to an infinite line.
+    /// This matches libslic3r's `Line::distance_to_infinite_squared()` static method.
+    pub fn distance_to_infinite_squared(p: Point, a: Point, b: Point) -> f64 {
+        let dir = b - a;
+        let len_sq = dir.length_squared();
+        if len_sq == 0 {
+            return p.distance_squared(&a) as f64;
+        }
+
+        // Distance² = cross(b-a, p-a)² / |b-a|²
+        let ap = p - a;
+        let cross = dir.x as i128 * ap.y as i128 - dir.y as i128 * ap.x as i128;
+        (cross * cross) as f64 / len_sq as f64
+    }
+
+    /// Static method: Calculate the distance from a point to an infinite line.
+    pub fn distance_to_infinite(p: Point, a: Point, b: Point) -> f64 {
+        Self::distance_to_infinite_squared(p, a, b).sqrt()
+    }
+
     /// Calculate the intersection point of two infinite lines.
     pub fn intersection_infinite(&self, other: &Line) -> Option<Point> {
         let d1 = self.direction();

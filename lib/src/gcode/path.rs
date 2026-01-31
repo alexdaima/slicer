@@ -24,6 +24,9 @@
 use std::f64::consts::PI;
 
 use crate::flow::Flow;
+use crate::geometry::simplify::{
+    simplify_polygon_comprehensive, simplify_polyline_comprehensive, SimplifyConfig,
+};
 use crate::geometry::{Point, PointF, Polygon, Polyline};
 use crate::infill::{InfillPath, InfillResult};
 use crate::perimeter::arachne::ArachneResult;
@@ -717,6 +720,11 @@ impl PathGenerator {
     ) -> Vec<ExtrusionPath> {
         let mut paths = Vec::new();
 
+        // Simplification config matching BambuStudio's meshfix parameters:
+        // - max_resolution: 0.5mm (segments shorter than this may be removed)
+        // - max_deviation: 0.025mm (25 microns - max allowed deviation from original path)
+        let simplify_config = SimplifyConfig::for_polygon();
+
         for loop_item in &perimeters.perimeters {
             let role = if loop_item.is_external {
                 ExtrusionRole::ExternalPerimeter
@@ -736,13 +744,21 @@ impl PathGenerator {
                 self.config.perimeter_speed
             };
 
-            let path = ExtrusionPath::from_polygon(&loop_item.polygon, role)
+            // Simplify the polygon to reduce point count while maintaining shape
+            // This matches BambuStudio's approach of simplifying toolpaths
+            let simplified_polygon =
+                simplify_polygon_comprehensive(&loop_item.polygon, &simplify_config);
+
+            let path = ExtrusionPath::from_polygon(&simplified_polygon, role)
                 .with_width(width)
                 .with_height(layer_height)
                 .with_speed(speed);
 
             paths.push(path);
         }
+
+        // Simplification config for polylines (open paths)
+        let polyline_simplify_config = SimplifyConfig::for_polyline();
 
         // Convert gap fills to extrusion paths
         // Gap fills use a smaller width and are printed at perimeter speed
@@ -756,7 +772,14 @@ impl PathGenerator {
             // we use a reasonable default
             let gap_width = self.config.perimeter_width * 0.7;
 
-            let path = ExtrusionPath::from_polyline(gap_fill, ExtrusionRole::GapFill)
+            // Simplify gap fill polyline
+            let simplified_gap =
+                simplify_polyline_comprehensive(gap_fill, &polyline_simplify_config);
+            if simplified_gap.len() < 2 {
+                continue;
+            }
+
+            let path = ExtrusionPath::from_polyline(&simplified_gap, ExtrusionRole::GapFill)
                 .with_width(gap_width)
                 .with_height(layer_height)
                 .with_speed(self.config.perimeter_speed);
@@ -773,7 +796,14 @@ impl PathGenerator {
             // Thin fills also use reduced width
             let thin_width = self.config.perimeter_width * 0.5;
 
-            let path = ExtrusionPath::from_polyline(thin_fill, ExtrusionRole::GapFill)
+            // Simplify thin fill polyline
+            let simplified_thin =
+                simplify_polyline_comprehensive(thin_fill, &polyline_simplify_config);
+            if simplified_thin.len() < 2 {
+                continue;
+            }
+
+            let path = ExtrusionPath::from_polyline(&simplified_thin, ExtrusionRole::GapFill)
                 .with_width(thin_width)
                 .with_height(layer_height)
                 .with_speed(self.config.perimeter_speed);
@@ -799,6 +829,10 @@ impl PathGenerator {
 
         // Threshold for splitting: if width varies by more than 20%, split into segments
         const WIDTH_VARIATION_THRESHOLD: CoordF = 0.20;
+
+        // Simplification config matching BambuStudio's meshfix parameters
+        let polygon_simplify_config = SimplifyConfig::for_polygon();
+        let polyline_simplify_config = SimplifyConfig::for_polyline();
 
         // Process each wall layer (outer to inner)
         for wall_lines in &arachne_result.toolpaths {
@@ -839,11 +873,17 @@ impl PathGenerator {
                         self.split_variable_width_line(line, role, layer_height, speed);
                     paths.extend(segment_paths);
                 } else {
-                    // Use average width for the whole path
+                    // Use average width for the whole path, with simplification
                     let path = if line.is_closed {
-                        ExtrusionPath::from_polygon(&line.to_polygon(), role)
+                        let polygon = line.to_polygon();
+                        let simplified =
+                            simplify_polygon_comprehensive(&polygon, &polygon_simplify_config);
+                        ExtrusionPath::from_polygon(&simplified, role)
                     } else {
-                        ExtrusionPath::from_polyline(&line.to_polyline(), role)
+                        let polyline = line.to_polyline();
+                        let simplified =
+                            simplify_polyline_comprehensive(&polyline, &polyline_simplify_config);
+                        ExtrusionPath::from_polyline(&simplified, role)
                     }
                     .with_width(avg_width)
                     .with_height(layer_height)
@@ -854,7 +894,7 @@ impl PathGenerator {
             }
         }
 
-        // Also add thin fills if any
+        // Also add thin fills if any (with simplification)
         for line in &arachne_result.thin_fills {
             if line.is_empty() || line.len() < 2 {
                 continue;
@@ -863,9 +903,17 @@ impl PathGenerator {
             let avg_width = line.average_width_mm();
 
             let path = if line.is_closed {
-                ExtrusionPath::from_polygon(&line.to_polygon(), ExtrusionRole::GapFill)
+                let polygon = line.to_polygon();
+                let simplified = simplify_polygon_comprehensive(&polygon, &polygon_simplify_config);
+                ExtrusionPath::from_polygon(&simplified, ExtrusionRole::GapFill)
             } else {
-                ExtrusionPath::from_polyline(&line.to_polyline(), ExtrusionRole::GapFill)
+                let polyline = line.to_polyline();
+                let simplified =
+                    simplify_polyline_comprehensive(&polyline, &polyline_simplify_config);
+                if simplified.len() < 2 {
+                    continue;
+                }
+                ExtrusionPath::from_polyline(&simplified, ExtrusionRole::GapFill)
             }
             .with_width(avg_width)
             .with_height(layer_height)
@@ -997,16 +1045,32 @@ impl PathGenerator {
             self.config.infill_speed
         };
 
+        // Simplification config for infill paths
+        // Use slightly more aggressive simplification for infill since it's internal
+        let polygon_simplify_config = SimplifyConfig::for_polygon();
+        let polyline_simplify_config = SimplifyConfig::for_polyline();
+
         for infill_path in &infill.paths {
             let path = match infill_path {
-                InfillPath::Line(polyline) => ExtrusionPath::from_polyline(polyline, role)
-                    .with_width(self.config.infill_width)
-                    .with_height(layer_height)
-                    .with_speed(speed),
-                InfillPath::Loop(polygon) => ExtrusionPath::from_polygon(polygon, role)
-                    .with_width(self.config.infill_width)
-                    .with_height(layer_height)
-                    .with_speed(speed),
+                InfillPath::Line(polyline) => {
+                    let simplified =
+                        simplify_polyline_comprehensive(polyline, &polyline_simplify_config);
+                    if simplified.len() < 2 {
+                        continue;
+                    }
+                    ExtrusionPath::from_polyline(&simplified, role)
+                        .with_width(self.config.infill_width)
+                        .with_height(layer_height)
+                        .with_speed(speed)
+                }
+                InfillPath::Loop(polygon) => {
+                    let simplified =
+                        simplify_polygon_comprehensive(polygon, &polygon_simplify_config);
+                    ExtrusionPath::from_polygon(&simplified, role)
+                        .with_width(self.config.infill_width)
+                        .with_height(layer_height)
+                        .with_speed(speed)
+                }
             };
 
             paths.push(path);

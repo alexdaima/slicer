@@ -25,6 +25,7 @@ mod line;
 mod point;
 mod polygon;
 mod polyline;
+pub mod simplify;
 mod transform;
 
 pub use bounding_box::{BoundingBox, BoundingBox3, BoundingBox3F, BoundingBoxF};
@@ -38,6 +39,14 @@ pub use line::{Line, Lines};
 pub use point::{Point, Point3, Point3F, PointF, Points, Points3};
 pub use polygon::{Polygon, Polygons};
 pub use polyline::{Polyline, Polylines};
+pub use simplify::{
+    douglas_peucker, douglas_peucker_polygon, douglas_peucker_polyline, remove_collinear_points,
+    remove_duplicate_points, simplify_comprehensive, simplify_polygon,
+    simplify_polygon_comprehensive, simplify_polygons, simplify_polyline,
+    simplify_polyline_comprehensive, simplify_polylines, simplify_resolution, SimplifyConfig,
+    COLLINEARITY_THRESHOLD, MESHFIX_MAXIMUM_DEVIATION, MESHFIX_MAXIMUM_EXTRUSION_AREA_DEVIATION,
+    MESHFIX_MAXIMUM_RESOLUTION, MINIMUM_SEGMENT_LENGTH,
+};
 pub use transform::{Transform2D, Transform3D};
 
 // Re-export AABB tree types

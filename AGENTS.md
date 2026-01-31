@@ -80,6 +80,7 @@ Each module has its own `AGENTS.md` with detailed documentation. Here's the quic
 | Module | Purpose | libslic3r Equivalent |
 |--------|---------|---------------------|
 | `geometry/` | Core types: Point, Polygon, ExPolygon, Line | `Point.cpp`, `Polygon.cpp`, `ExPolygon.cpp`, `Line.cpp` |
+| `geometry/simplify` | Path simplification (Douglas-Peucker, resolution-based) | `MultiPoint.cpp`, `Arachne/utils/ExtrusionLine.cpp` |
 | `mesh/` | Triangle mesh loading and processing | `TriangleMesh.cpp`, STL format handlers |
 | `slice/` | Mesh slicing into layers | `TriangleMeshSlicer.cpp`, `Slicing.cpp`, `Layer.cpp` |
 | `perimeter/` | Perimeter/shell generation | `PerimeterGenerator.cpp` |

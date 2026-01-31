@@ -167,6 +167,14 @@ pub use profiles::{
 pub use geometry::elephant_foot::{ElephantFootCompensator, ElephantFootConfig};
 pub use geometry::{BoundingBox, BoundingBox3, ExPolygon, Line, Point, Point3, Polygon, Polyline};
 
+// Re-export path simplification
+pub use geometry::simplify::{
+    douglas_peucker, douglas_peucker_polygon, douglas_peucker_polyline, simplify_comprehensive,
+    simplify_polygon, simplify_polygon_comprehensive, simplify_polygons, simplify_polyline,
+    simplify_polyline_comprehensive, simplify_polylines, SimplifyConfig, MESHFIX_MAXIMUM_DEVIATION,
+    MESHFIX_MAXIMUM_RESOLUTION,
+};
+
 // Re-export AABB tree types
 pub use geometry::{
     closest_point_on_triangle, ray_box_intersect, ray_triangle_intersect, AABBClosestPointResult,

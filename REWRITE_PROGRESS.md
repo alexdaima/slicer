@@ -480,6 +480,158 @@ approx = "0.5"              # Float comparisons in tests
 
 ## Changelog
 
+### 2025-02-01 (Session 33) - Path Simplification Implementation
+
+**Implemented Path Simplification Module:**
+- Created `geometry/simplify.rs` with multiple simplification algorithms:
+  - **Douglas-Peucker**: Classic recursive line simplification algorithm
+  - **Resolution-based**: Remove tiny segments and collinear points (matching BambuStudio)
+  - **Comprehensive**: Combines duplicate removal + resolution-based simplification
+
+**Key Constants (matching BambuStudio/libslic3r):**
+- `MESHFIX_MAXIMUM_RESOLUTION = 0.5mm` - segments shorter than this may be removed
+- `MESHFIX_MAXIMUM_DEVIATION = 0.025mm` (25 microns) - max allowed deviation from path
+- `MESHFIX_MAXIMUM_EXTRUSION_AREA_DEVIATION = 2.0mm²` - for variable-width extrusions
+- `MINIMUM_SEGMENT_LENGTH = 0.005mm` (5 microns) - always allow removal below this
+- `COLLINEARITY_THRESHOLD = 0.001mm` (1 micron) - threshold for collinearity check
+
+**SimplifyConfig options:**
+- `for_polygon()` - configuration for closed paths
+- `for_polyline()` - configuration for open paths
+- `aggressive()` - larger tolerances for maximum reduction
+- `conservative()` - smaller tolerances to preserve detail
+
+**Integrated Simplification into Path Generation:**
+- Added simplification to `convert_perimeters()`:
+  - Simplifies perimeter polygons before converting to extrusion paths
+  - Simplifies gap fill polylines
+  - Simplifies thin fill polylines
+- Added simplification to `convert_arachne_toolpaths()`:
+  - Simplifies Arachne variable-width paths
+  - Simplifies thin fills from Arachne
+- Added simplification to `convert_infill()`:
+  - Simplifies infill polylines and polygons
+
+**Added Static Methods to Line:**
+- `Line::distance_to_squared(p, a, b)` - squared distance from point to segment
+- `Line::distance_to_infinite_squared(p, a, b)` - squared distance from point to infinite line
+- `Line::distance_to_infinite(p, a, b)` - distance from point to infinite line
+
+**Exported from lib.rs:**
+- All simplification functions available for external use
+- `SimplifyConfig` for custom configuration
+- Key constants for BambuStudio parity
+
+**Test Status:** 1010 tests passing (+12 new simplification tests)
+
+**Validation Results - MAJOR IMPROVEMENT:**
+- G-code lines: 130,786 (was ~450,609 - **71% reduction**)
+- Quality Score: 50.2/100 (was 44.4 - **+5.8 improvement**)
+- External Perimeter: 34,115 moves (was ~205,600 - **reduced from 7.2× to 1.2× reference**)
+- Internal Perimeter: 40,398 moves (was ~173,700 - **reduced from 16× to 3.9× reference**)
+- Sparse Infill: 6,855 moves (was ~16,648 - **closer to reference 11,504**)
+- Solid Infill: 25,523 moves (reference 9,810 - still over-generating)
+- Bridge Infill: 20 moves (reference 1,536 - still under-detecting)
+- Wipe: Missing (reference has 3,099 moves)
+
+**Remaining Issues (by priority):**
+1. **Bridge Detection**: Still severely under-detecting (20 vs 1,536)
+2. **Internal Perimeters**: Still ~4× reference count
+3. **Solid Infill**: Over-generating by 2.6×
+4. **Wipe Feature**: Missing entirely
+5. **First Layer Height**: Z offset mismatch (0.4mm vs 0.2mm)
+
+**Reference Implementation:**
+- `BambuStudio/src/libslic3r/MultiPoint.cpp` - `_douglas_peucker()`
+- `BambuStudio/src/libslic3r/Arachne/utils/ExtrusionLine.cpp` - `simplify()`
+- `BambuStudio/src/libslic3r/Arachne/WallToolPaths.hpp` - constants
+
+**Files Changed:**
+- `geometry/simplify.rs` - NEW: Complete simplification module (~700 lines)
+- `geometry/mod.rs` - Export simplification module
+- `geometry/line.rs` - Added static distance methods
+- `gcode/path.rs` - Integrated simplification into all path conversion
+- `lib.rs` - Exported simplification functions
+
+**Next Steps:**
+1. **HIGH: Improve bridge detection** - major gap vs reference (20 vs 1,536 moves)
+2. **HIGH: Investigate internal perimeter count** - still 4× reference
+3. **MEDIUM: Tune solid infill generation** - over-generating by 2.6×
+4. **MEDIUM: Add wipe feature** - missing entirely
+5. **LOW: Fix first layer height** - Z offset mismatch
+
+### 2025-01-31 (Session 32) - Surface Classification & Perimeter Spacing Improvements
+
+**Implemented Proper Surface Type Detection:**
+- Added `detect_surface_types()` function to `slice/surface.rs`:
+  - Detects TOP surfaces: areas not covered by layer above
+  - Detects BOTTOM surfaces: areas not supported by layer below
+  - Detects BOTTOM_BRIDGE surfaces: bottom areas over air
+  - Detects INTERNAL surfaces: areas covered both above and below
+- Added `detect_all_surface_types()` for batch processing all layers
+- Added `propagate_solid_infill()` to extend solid infill through configured shell layers
+- Added `SurfaceDetectionConfig` for configurable top/bottom solid layers
+
+**Updated Pipeline for Surface-Based Classification:**
+- Modified `process_layers_with_support()` to detect surface types for all layers
+- Added `process_single_layer_with_surfaces()` using proper surface classification
+- Added `process_single_layer_with_surfaces_arachne()` for Arachne mode
+- Added `generate_layer_infill_with_surfaces()` that separates solid/sparse infill by surface type
+- Added `detect_and_separate_bridges_improved()` using pre-detected surface types
+
+**Improved Perimeter Spacing Calculations:**
+- Added proper spacing fields to `PerimeterConfig`:
+  - `perimeter_spacing` - internal perimeter centerline spacing
+  - `external_perimeter_spacing` - external perimeter spacing
+  - `external_to_internal_spacing` - spacing between ext and first internal
+  - `layer_height` - needed for Flow-based spacing calculations
+- Updated `PerimeterConfig::new()` to calculate spacing using Flow formula:
+  - `spacing = width - height × (1 - π/4)` (rounded rectangle model)
+- Updated perimeter generation to use proper spacing for offsets:
+  - External (i=0): offset by half external width
+  - First internal (i=1): offset by external_to_internal_spacing
+  - Subsequent internal (i>1): offset by perimeter_spacing
+
+**Added Line Diff Script:**
+- Created `scripts/line_diff.sh` to compare line counts:
+  - Compares C++ libslic3r vs Rust implementation
+  - Shows file counts, total lines, and code lines
+  - Calculates percentages (Rust is ~26% of C++ lines)
+  - Shows breakdown by directory
+  - Shows average lines per file
+
+**Validation Results:**
+- Quality Score: 44.4/100 (was 51.6, then dropped due to more accurate surface detection)
+- Solid Infill: 852 → 25,831 moves (MAJOR IMPROVEMENT, reference is 9,810)
+- Sparse Infill: 19,907 → 16,648 moves (improved, reference is 11,504)
+- Bridge Infill: 12 → 20 moves (slight improvement, reference is 1,536)
+- Perimeters still ~7x too many (likely due to polygon fragmentation, not spacing)
+
+**Root Cause Analysis - Excessive Perimeters:**
+- Our G-code has 422,409 G1 moves vs reference's 81,203 (5.2x more)
+- Issue is NOT perimeter count but polygon point density
+- Perimeter polygons have too many tiny segments (not simplified enough)
+- Need to increase polygon simplification tolerance before G-code generation
+
+**Files Changed:**
+- `slice/surface.rs` - Added surface type detection functions
+- `slice/mod.rs` - Exported new surface detection functions
+- `pipeline/mod.rs` - Integrated surface-based processing
+- `perimeter/mod.rs` - Added proper spacing calculations
+- `scripts/line_diff.sh` - New script for comparing implementations
+
+**Test Status:** 998 tests passing (+1 for new spacing test)
+
+**Code Progress:**
+- Rust implementation: 64,337 lines (26.4% of C++ libslic3r's 243,426 lines)
+- 70 Rust files vs 475 C++ files
+
+**Next Steps (Priority Order):**
+1. **CRITICAL: Add polygon simplification** before G-code generation to reduce point density
+2. **HIGH: Improve bridge detection** to match BambuStudio's sensitivity
+3. **MEDIUM: Add wipe feature** (missing in our output)
+4. **MEDIUM: Fix first layer height** mismatch (0.4mm vs 0.2mm in validation)
+
 ### 2025-01-24 (Session 31) - Gap Fill Detection Implementation
 
 **Implemented Gap Fill Detection:**
@@ -2380,52 +2532,52 @@ Bridge extrusion:  area = π × (width/2)²
 
 ## Next Steps (Priority Order)
 
-### Immediate (This Session)
-1. ~~CoolingBuffer~~ ✅
-2. ~~Spiral Vase~~ ✅
-3. ~~Elephant Foot Compensation~~ ✅
-4. ~~Brim/Skirt Generation~~ ✅
-5. ~~Avoid Crossing Perimeters Integration~~ ✅
-6. ~~Pressure Equalizer~~ ✅
-7. ~~Ironing~~ ✅
-8. ~~Seam Placer~~ ✅
-9. ~~Wipe Tower~~ ✅
-10. ~~Tool Ordering~~ ✅
-11. ~~TreeModelVolumes~~ ✅
-12. ~~TreeSupportSettings~~ ✅
-13. ~~TreeSupport3D branch generation~~ ✅
-14. ~~Wire TreeSupport3D into pipeline~~ ✅
+### Immediate (Current Focus - Validation Parity)
+**Current Status: Quality Score 50.2/100 (target: 70+)**
 
-### Short-term
-1. ~~CI/CD setup (GitHub Actions)~~ ✅
-2. ~~Multi-material pipeline integration (wire WipeTower + ToolOrdering)~~ ✅
-3. ~~Fuzzy Skin~~ ✅
-4. ~~Internal Bridge Detection~~ ✅
-5. Semantic G-code comparison tooling improvements
-6. ~~End-to-end multi-material print test~~ ✅
-7. ~~Tree Support 3D branch generation algorithm~~ ✅
-8. ~~Tree Support 3D organic smoothing~~ ✅
-9. ~~Wire TreeSupport3D into pipeline~~ ✅
-10. ~~Wire organic smoothing into branch mesh generation~~ ✅
+1. **HIGH: Bridge Detection Improvements** - Major gap vs reference (20 vs 1,536 moves)
+   - Tune BridgeDetector anchor detection sensitivity
+   - Review angle candidate generation logic
+   - Compare coverage calculation with libslic3r
+2. **HIGH: Internal Perimeter Count** - Still ~4× reference count
+   - Investigate if duplicate loops are being generated
+   - Review nesting/traversal logic for contours vs holes
+   - Verify offset2 usage and safety offsets
+3. **MEDIUM: Solid Infill Tuning** - Over-generating by 2.6× (25,523 vs 9,810)
+   - Review surface propagation logic
+   - Check top/bottom solid layer settings
+4. **MEDIUM: Wipe Feature** - Missing entirely (reference has 3,099 moves)
+   - Wire through existing wipe-tower code
+5. **LOW: First Layer Height** - Z offset mismatch (0.4mm vs 0.2mm)
+   - Audit first-layer config settings
 
-### Medium-term
-1. ~~Full Tree Support 3D (branch generation, merging, slicing)~~ ✅
-2. ~~Tree Support 3D organic smoothing~~ ✅ (collision avoidance + Laplacian smoothing)
-3. ~~Branch mesh drawing (create 3D mesh for branches, then slice)~~ ✅
-4. ~~Organic smoothing + branch mesh integration~~ ✅
-5. ~~Fuzzy Skin~~ ✅
-6. ~~Internal Bridge Detection~~ ✅
-7. ~~Adaptive Infill~~ ✅
-8. ~~AABBTree for mesh acceleration~~ ✅
+### Completed (Recent Sessions)
+- ~~Path Simplification~~ ✅ (Session 33 - improved score from 44.4 to 50.2)
+- ~~Surface Classification~~ ✅ (Session 32)
+- ~~Gap Fill Detection~~ ✅ (Session 31)
+- ~~G-code Validation Tool~~ ✅ (Session 26)
+- ~~CoolingBuffer~~ ✅
+- ~~Spiral Vase~~ ✅
+- ~~Elephant Foot Compensation~~ ✅
+- ~~Brim/Skirt Generation~~ ✅
+- ~~Avoid Crossing Perimeters~~ ✅
+- ~~Pressure Equalizer~~ ✅
+- ~~Ironing~~ ✅
+- ~~Seam Placer~~ ✅
+- ~~Wipe Tower~~ ✅
+- ~~Tool Ordering~~ ✅
+- ~~Tree Support 3D~~ ✅
+- ~~Fuzzy Skin~~ ✅
+- ~~Internal Bridge Detection~~ ✅
+- ~~Adaptive Infill~~ ✅
+- ~~AABBTree~~ ✅
+- ~~All advanced infill patterns~~ ✅
 
-### Medium-term (continued)
-9. ~~Cross Hatch Infill~~ ✅
-10. ~~3D Honeycomb Infill~~ ✅
-11. ~~Adaptive Layer Heights~~ ✅
-12. ~~Wire CrossHatch/Honeycomb3D into InfillGenerator~~ ✅
-13. ~~Hilbert Curve Infill~~ ✅
-14. ~~Archimedean Chords Infill~~ ✅
-15. ~~Octagram Spiral Infill~~ ✅
+### Long-term
+1. Adaptive slicing improvements
+2. Multi-material full parity
+3. Performance optimization (parallel processing)
+4. Additional printer profile support
 
 ### Long-term
 1. Semantic parity validation

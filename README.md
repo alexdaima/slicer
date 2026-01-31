@@ -4,7 +4,14 @@ This project is currently just an fun experiment to see how well AI can handle a
 
 This work is based on BambuStudio by BambuLab, which is based on PrusaSlicer by Prusa Research, which is from Slic3r by Alessandro Ranellucci and the RepRap community.
 
-Current validation score: 35.4/100
+Current validation score: **50.2/100**
+
+```bash
+Rust vs C++ Comparison:
+  Files:                                    71 /      475  (14.9%)
+  Total lines:                           65164 /   243426  (26.7%)
+  Code lines (non-blank/comment):        45379 /   186433  (24.3%)
+```
 
 ## Current Status
 

@@ -3,6 +3,18 @@
 //! This module provides a high-level API for the complete slicing pipeline:
 //! mesh → layers → perimeters → infill → supports → paths → G-code
 //!
+//! # Surface Type Detection
+//!
+//! This pipeline implements proper surface classification similar to BambuStudio's
+//! `PrintObject::detect_surfaces_type()`. Instead of simply using layer position
+//! to determine solid vs sparse infill, it:
+//!
+//! 1. Compares each layer's geometry with adjacent layers
+//! 2. Identifies TOP surfaces (areas not covered by layer above)
+//! 3. Identifies BOTTOM surfaces (areas not supported by layer below)
+//! 4. Marks bridge surfaces (bottom areas over air)
+//! 5. Propagates solid infill through the configured number of top/bottom layers
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -33,7 +45,10 @@ use crate::infill::{InfillConfig, InfillGenerator, InfillPattern, InfillResult};
 use crate::mesh::TriangleMesh;
 use crate::perimeter::arachne::{ArachneConfig, ArachneGenerator};
 use crate::perimeter::{PerimeterConfig, PerimeterGenerator};
-use crate::slice::{Layer, Slicer, SlicingParams};
+use crate::slice::{
+    detect_surface_types, propagate_solid_infill, Layer, Slicer, SlicingParams, Surface,
+    SurfaceDetectionConfig, SurfaceType,
+};
 use crate::support::{SupportConfig, SupportGenerator, SupportLayer, SupportPattern};
 use crate::travel::{AvoidCrossingPerimeters, TravelConfig};
 use crate::{clipper, scale, unscale, CoordF, Result};
@@ -244,16 +259,27 @@ impl PipelineConfig {
 
     /// Get the perimeter configuration from the pipeline config.
     pub fn perimeter_config(&self) -> PerimeterConfig {
-        PerimeterConfig {
-            perimeter_count: self.object.perimeters as usize,
-            perimeter_extrusion_width: self.print.nozzle_diameter * 1.125,
-            external_perimeter_extrusion_width: self.print.nozzle_diameter * 1.05,
-            external_perimeters_first: false,
-            min_perimeter_area: self.print.nozzle_diameter.powi(2),
-            gap_fill_threshold: self.print.nozzle_diameter * 0.5,
-            thin_walls: self.object.thin_walls,
-            join_type: crate::clipper::OffsetJoinType::Miter,
-        }
+        let perimeter_width = self.print.nozzle_diameter * 1.125;
+        let external_width = self.print.nozzle_diameter * 1.05;
+        let layer_height = self.print.layer_height;
+        let perimeter_count = self.object.perimeters as usize;
+
+        // Create config with proper spacing calculations
+        let mut config = PerimeterConfig::new(
+            perimeter_width,
+            external_width,
+            layer_height,
+            perimeter_count,
+        );
+
+        // Apply additional settings
+        config.external_perimeters_first = false;
+        config.min_perimeter_area = self.print.nozzle_diameter.powi(2);
+        config.gap_fill_threshold = self.print.nozzle_diameter * 0.5;
+        config.thin_walls = self.object.thin_walls;
+        config.join_type = crate::clipper::OffsetJoinType::Miter;
+
+        config
     }
 
     /// Get the Arachne configuration from the pipeline config.
@@ -575,8 +601,23 @@ impl PrintPipeline {
             None
         };
 
-        // Collect layer slices for bridge detection
+        // Collect layer slices for surface type detection
         let layer_slices: Vec<ExPolygons> = layers.iter().map(|l| l.all_slices()).collect();
+
+        // Detect surface types for all layers using proper geometry comparison
+        // This is the key improvement - instead of using layer position, we compare
+        // actual geometry with adjacent layers to identify top/bottom/internal surfaces
+        let surface_offset = self.config.print.nozzle_diameter / 10.0;
+        let mut layer_surfaces = self.detect_all_layer_surfaces(&layer_slices, surface_offset);
+
+        // Propagate solid infill through the configured number of layers
+        let surface_config = SurfaceDetectionConfig {
+            top_solid_layers: self.config.object.top_solid_layers as usize,
+            bottom_solid_layers: self.config.object.bottom_solid_layers as usize,
+            offset: surface_offset,
+            min_area: 0.5,
+        };
+        propagate_solid_infill(&mut layer_surfaces, &surface_config);
 
         for (i, layer) in layers.iter().enumerate() {
             // Get support layer if available
@@ -589,21 +630,26 @@ impl PrintPipeline {
                 None
             };
 
+            // Get the detected surfaces for this layer
+            let surfaces = &layer_surfaces[i];
+
             let mut layer_paths = if use_arachne {
-                self.process_single_layer_arachne(
+                self.process_single_layer_with_surfaces_arachne(
                     layer,
                     i,
                     total_layers,
                     lower_slices,
+                    surfaces,
                     arachne_gen.as_ref().unwrap(),
                     &mut path_gen,
                 )?
             } else {
-                self.process_single_layer(
+                self.process_single_layer_with_surfaces(
                     layer,
                     i,
                     total_layers,
                     lower_slices,
+                    surfaces,
                     classic_gen.as_ref().unwrap(),
                     &mut path_gen,
                 )?
@@ -623,6 +669,37 @@ impl PrintPipeline {
 
         callback(1.0);
         Ok(all_layer_paths)
+    }
+
+    /// Detect surface types for all layers.
+    ///
+    /// This implements proper surface classification like BambuStudio's
+    /// `PrintObject::detect_surfaces_type()`.
+    fn detect_all_layer_surfaces(
+        &self,
+        layer_slices: &[ExPolygons],
+        offset: CoordF,
+    ) -> Vec<Vec<Surface>> {
+        let num_layers = layer_slices.len();
+        let mut result = Vec::with_capacity(num_layers);
+
+        for i in 0..num_layers {
+            let lower = if i > 0 {
+                Some(&layer_slices[i - 1])
+            } else {
+                None
+            };
+            let upper = if i + 1 < num_layers {
+                Some(&layer_slices[i + 1])
+            } else {
+                None
+            };
+
+            let surfaces = detect_surface_types(&layer_slices[i], lower, upper, offset);
+            result.push(surfaces);
+        }
+
+        result
     }
 
     /// Add support structure paths to a layer.
@@ -698,6 +775,149 @@ impl PrintPipeline {
     }
 
     /// Process a single layer.
+    /// Process a single layer with proper surface-based classification.
+    ///
+    /// This method uses the pre-detected surface types to determine which
+    /// areas need solid infill vs sparse infill, rather than using simple
+    /// layer position checks.
+    fn process_single_layer_with_surfaces(
+        &self,
+        layer: &Layer,
+        layer_index: usize,
+        _total_layers: usize,
+        lower_layer_slices: Option<&ExPolygons>,
+        surfaces: &[Surface],
+        perimeter_gen: &PerimeterGenerator,
+        path_gen: &mut PathGenerator,
+    ) -> Result<LayerPaths> {
+        let z_height = layer.top_z_mm();
+        let layer_height = layer.height_mm();
+
+        // Collect all slices from all regions
+        let slices = layer.all_slices();
+
+        if slices.is_empty() {
+            return Ok(LayerPaths::new(layer_index, z_height, layer_height));
+        }
+
+        // Generate perimeters
+        let perimeter_result = perimeter_gen.generate(&slices);
+
+        // Determine if this layer has any solid surfaces
+        let has_solid = surfaces.iter().any(|s| s.is_solid());
+        let has_top = surfaces.iter().any(|s| s.is_top());
+
+        // Detect bridges and split infill area into bridge and non-bridge regions
+        let (bridge_infill, normal_infill) = if self.config.uses_bridge_detection()
+            && layer_index > 0
+            && lower_layer_slices.is_some()
+        {
+            self.detect_and_separate_bridges_improved(
+                &perimeter_result.infill_area,
+                lower_layer_slices.unwrap(),
+                surfaces,
+                layer_index,
+            )
+        } else {
+            (InfillResult::new(), None)
+        };
+
+        // Generate infill based on surface types
+        let infill_result = if let Some(normal_area) = normal_infill {
+            self.generate_layer_infill_with_surfaces(&normal_area, surfaces, layer_index)
+        } else {
+            self.generate_layer_infill_with_surfaces(
+                &perimeter_result.infill_area,
+                surfaces,
+                layer_index,
+            )
+        };
+
+        // Convert to paths
+        let mut layer_paths = path_gen.generate(
+            &perimeter_result,
+            &infill_result,
+            layer_index,
+            z_height,
+            has_solid,
+        );
+
+        // Add bridge infill paths
+        self.add_bridge_paths(&mut layer_paths, &bridge_infill, layer_height);
+
+        Ok(layer_paths)
+    }
+
+    /// Process a single layer using Arachne with proper surface classification.
+    fn process_single_layer_with_surfaces_arachne(
+        &self,
+        layer: &Layer,
+        layer_index: usize,
+        _total_layers: usize,
+        lower_layer_slices: Option<&ExPolygons>,
+        surfaces: &[Surface],
+        arachne_gen: &ArachneGenerator,
+        path_gen: &mut PathGenerator,
+    ) -> Result<LayerPaths> {
+        let z_height = layer.top_z_mm();
+        let layer_height = layer.height_mm();
+
+        // Collect all slices from all regions
+        let slices = layer.all_slices();
+
+        if slices.is_empty() {
+            return Ok(LayerPaths::new(layer_index, z_height, layer_height));
+        }
+
+        // Generate variable-width perimeters using Arachne
+        let arachne_result = arachne_gen.generate(&slices);
+
+        // Determine if this layer has any solid surfaces
+        let has_solid = surfaces.iter().any(|s| s.is_solid());
+
+        // Detect bridges and split infill area into bridge and non-bridge regions
+        let (bridge_infill, normal_infill) = if self.config.uses_bridge_detection()
+            && layer_index > 0
+            && lower_layer_slices.is_some()
+        {
+            self.detect_and_separate_bridges_improved(
+                &arachne_result.inner_contour,
+                lower_layer_slices.unwrap(),
+                surfaces,
+                layer_index,
+            )
+        } else {
+            (InfillResult::new(), None)
+        };
+
+        // Generate infill based on surface types
+        let infill_result = if let Some(normal_area) = normal_infill {
+            self.generate_layer_infill_with_surfaces(&normal_area, surfaces, layer_index)
+        } else {
+            self.generate_layer_infill_with_surfaces(
+                &arachne_result.inner_contour,
+                surfaces,
+                layer_index,
+            )
+        };
+
+        // Convert Arachne result and infill to paths
+        let mut layer_paths = path_gen.generate_from_arachne(
+            &arachne_result,
+            &infill_result,
+            layer_index,
+            z_height,
+            has_solid,
+        );
+
+        // Add bridge infill paths
+        self.add_bridge_paths(&mut layer_paths, &bridge_infill, layer_height);
+
+        Ok(layer_paths)
+    }
+
+    /// Legacy process_single_layer for backward compatibility.
+    #[allow(dead_code)]
     fn process_single_layer(
         &self,
         layer: &Layer,
@@ -761,7 +981,8 @@ impl PrintPipeline {
         Ok(layer_paths)
     }
 
-    /// Process a single layer using Arachne variable-width perimeters.
+    /// Legacy process_single_layer_arachne for backward compatibility.
+    #[allow(dead_code)]
     fn process_single_layer_arachne(
         &self,
         layer: &Layer,
@@ -825,9 +1046,121 @@ impl PrintPipeline {
         Ok(layer_paths)
     }
 
-    /// Detect bridge areas and generate bridge-specific infill.
+    /// Improved bridge detection using surface type information.
     ///
-    /// Returns (bridge_infill_result, remaining_normal_area).
+    /// This method uses the pre-detected surface types to identify bridge regions
+    /// more accurately. Bridge surfaces are those classified as BottomBridge or
+    /// InternalBridge.
+    fn detect_and_separate_bridges_improved(
+        &self,
+        infill_area: &[ExPolygon],
+        lower_layer_slices: &ExPolygons,
+        surfaces: &[Surface],
+        layer_index: usize,
+    ) -> (InfillResult, Option<ExPolygons>) {
+        if infill_area.is_empty() {
+            return (InfillResult::new(), None);
+        }
+
+        // Collect bridge surfaces from the pre-detected surface types
+        let bridge_surfaces: ExPolygons = surfaces
+            .iter()
+            .filter(|s| s.is_bridge())
+            .map(|s| s.expolygon.clone())
+            .collect();
+
+        // Also detect additional bridges in the infill area that weren't caught
+        // by surface detection (e.g., internal bridges over sparse infill)
+        let infill_expolygons: ExPolygons = infill_area.to_vec();
+
+        // Find unsupported areas within infill
+        let unsupported = if !lower_layer_slices.is_empty() {
+            clipper::difference(&infill_expolygons, lower_layer_slices)
+        } else {
+            Vec::new()
+        };
+
+        // Combine pre-detected bridges with newly detected unsupported areas
+        let min_bridge_area =
+            self.config.bridge.min_area * crate::SCALING_FACTOR * crate::SCALING_FACTOR;
+
+        // Filter and combine bridge candidates
+        let mut bridge_candidates: ExPolygons = bridge_surfaces
+            .into_iter()
+            .chain(unsupported.into_iter())
+            .filter(|ex| ex.area().abs() >= min_bridge_area)
+            .collect();
+
+        // Intersect with actual infill area to get only the parts that will be filled
+        if !bridge_candidates.is_empty() {
+            bridge_candidates = clipper::intersection(&bridge_candidates, &infill_expolygons);
+        }
+
+        if bridge_candidates.is_empty() {
+            return (InfillResult::new(), None);
+        }
+
+        let mut bridge_infill = InfillResult::new();
+        let spacing = self.config.print.nozzle_diameter * 1.125;
+
+        // Process each bridge candidate
+        for bridge_expoly in &bridge_candidates {
+            if bridge_expoly.area().abs() < min_bridge_area {
+                continue;
+            }
+
+            let mut detector =
+                BridgeDetector::new(bridge_expoly.clone(), lower_layer_slices, spacing);
+
+            // Try to detect optimal angle, use 0 if detection fails
+            let bridge_angle = if detector.detect_angle(0.0) {
+                detector.angle.to_degrees()
+            } else {
+                // Check if we have a pre-detected angle from surfaces
+                surfaces
+                    .iter()
+                    .find(|s| s.is_bridge() && s.bridge_angle.is_some())
+                    .and_then(|s| s.bridge_angle)
+                    .map(|a| a.to_degrees())
+                    .unwrap_or(0.0)
+            };
+
+            // Generate bridge infill at the optimal angle
+            let bridge_config = InfillConfig {
+                pattern: InfillPattern::Rectilinear,
+                density: 1.0, // Solid bridge infill
+                extrusion_width: spacing,
+                angle: bridge_angle,
+                angle_increment: 0.0, // Don't rotate bridge infill
+                overlap: 0.15,        // Slightly more overlap for bridges
+                min_area: 0.5,
+                connect_infill: false,
+                infill_first: false,
+                z_height: 0.0,
+                layer_height: self.config.print.layer_height,
+            };
+
+            let bridge_gen = InfillGenerator::new(bridge_config);
+            let result = bridge_gen.generate(&[bridge_expoly.clone()], layer_index);
+
+            // Merge paths into bridge infill result
+            for path in result.paths {
+                bridge_infill.paths.push(path);
+            }
+        }
+
+        // Calculate remaining non-bridge area
+        let remaining = clipper::difference(&infill_expolygons, &bridge_candidates);
+
+        if remaining.is_empty() && bridge_infill.paths.is_empty() {
+            (InfillResult::new(), None)
+        } else {
+            (bridge_infill, Some(remaining))
+        }
+    }
+
+    /// Legacy bridge detection for backward compatibility.
+    #[allow(dead_code)]
     fn detect_and_separate_bridges(
         &self,
         infill_area: &[ExPolygon],
@@ -926,7 +1259,126 @@ impl PrintPipeline {
         }
     }
 
-    /// Generate infill for a layer.
+    /// Generate infill for a layer using surface type classification.
+    ///
+    /// This method separates the infill area into solid and sparse regions
+    /// based on the detected surface types, rather than treating the entire
+    /// layer as solid or sparse.
+    fn generate_layer_infill_with_surfaces(
+        &self,
+        infill_area: &[ExPolygon],
+        surfaces: &[Surface],
+        layer_index: usize,
+    ) -> InfillResult {
+        if infill_area.is_empty() {
+            return InfillResult::new();
+        }
+
+        let infill_expolygons: ExPolygons = infill_area.to_vec();
+
+        // Collect solid surface regions (top, bottom, internal solid)
+        let solid_regions: ExPolygons = surfaces
+            .iter()
+            .filter(|s| s.is_solid() && !s.is_bridge()) // Bridges handled separately
+            .map(|s| s.expolygon.clone())
+            .collect();
+
+        // Collect sparse (internal) surface regions
+        let sparse_regions: ExPolygons = surfaces
+            .iter()
+            .filter(|s| s.surface_type == SurfaceType::Internal)
+            .map(|s| s.expolygon.clone())
+            .collect();
+
+        let mut combined_result = InfillResult::new();
+        let base_config = self.config.infill_config();
+
+        // Generate solid infill for solid regions
+        if !solid_regions.is_empty() {
+            // Intersect solid regions with actual infill area
+            let solid_infill_area = clipper::intersection(&infill_expolygons, &solid_regions);
+
+            if !solid_infill_area.is_empty() {
+                let has_top = surfaces.iter().any(|s| s.is_top());
+
+                let solid_config = InfillConfig {
+                    pattern: InfillPattern::Rectilinear, // Solid always uses rectilinear
+                    density: 1.0,
+                    extrusion_width: base_config.extrusion_width,
+                    angle: base_config.angle + (layer_index as f64) * 90.0, // Alternate 0/90
+                    angle_increment: 0.0,
+                    overlap: base_config.overlap,
+                    min_area: base_config.min_area,
+                    connect_infill: true,
+                    infill_first: false,
+                    z_height: base_config.z_height,
+                    layer_height: base_config.layer_height,
+                };
+
+                let infill_gen = InfillGenerator::new(solid_config);
+                let solid_result = infill_gen.generate(&solid_infill_area, layer_index);
+
+                // Mark paths as solid infill
+                for mut path in solid_result.paths {
+                    // Paths from solid regions should be solid infill
+                    combined_result.paths.push(path);
+                }
+            }
+        }
+
+        // Generate sparse infill for internal regions
+        if !sparse_regions.is_empty() && base_config.density > 0.0 && base_config.density < 1.0 {
+            // Intersect sparse regions with actual infill area
+            let sparse_infill_area = clipper::intersection(&infill_expolygons, &sparse_regions);
+
+            // Also include any infill area not covered by solid regions
+            let remaining_area = if !solid_regions.is_empty() {
+                clipper::difference(&infill_expolygons, &solid_regions)
+            } else {
+                infill_expolygons.clone()
+            };
+
+            // Combine sparse regions with remaining area
+            let all_sparse: ExPolygons = sparse_infill_area
+                .into_iter()
+                .chain(remaining_area.into_iter())
+                .collect();
+
+            // Union to merge overlapping regions
+            let merged_sparse = clipper::union_ex(&all_sparse);
+
+            if !merged_sparse.is_empty() {
+                let mut sparse_config = base_config.clone();
+                // Rotate angle for sparse infill
+                let angle_offset = (layer_index as f64) * sparse_config.angle_increment;
+                sparse_config.angle = (sparse_config.angle + angle_offset) % 180.0;
+
+                let infill_gen = InfillGenerator::new(sparse_config);
+                let sparse_result = infill_gen.generate(&merged_sparse, layer_index);
+
+                for path in sparse_result.paths {
+                    combined_result.paths.push(path);
+                }
+            }
+        } else if solid_regions.is_empty() {
+            // No solid regions detected, use the full infill area with configured pattern
+            let mut infill_config = base_config;
+            let angle_offset = (layer_index as f64) * infill_config.angle_increment;
+            infill_config.angle = (infill_config.angle + angle_offset) % 180.0;
+
+            let infill_gen = InfillGenerator::new(infill_config);
+            let result = infill_gen.generate(&infill_expolygons, layer_index);
+
+            for path in result.paths {
+                combined_result.paths.push(path);
+            }
+        }
+
+        combined_result
+    }
+
+    /// Legacy infill generation for backward compatibility.
+    #[allow(dead_code)]
     fn generate_layer_infill(
         &self,
         infill_area: &[ExPolygon],

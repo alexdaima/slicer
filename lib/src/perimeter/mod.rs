@@ -33,9 +33,8 @@
 pub mod arachne;
 pub mod fuzzy_skin;
 
-use crate::clipper::{
-    detect_gaps, difference, extract_centerlines, grow, offset2, shrink, OffsetJoinType,
-};
+use crate::clipper::{difference, extract_centerlines, grow, offset2, shrink, OffsetJoinType};
+use crate::flow::Flow;
 use crate::geometry::{ExPolygon, ExPolygons, Polygon, Polyline};
 use crate::CoordF;
 
@@ -53,6 +52,21 @@ pub struct PerimeterConfig {
 
     /// Extrusion width for external (outer) perimeters (mm).
     pub external_perimeter_extrusion_width: CoordF,
+
+    /// Spacing between internal perimeter centerlines (mm).
+    /// This is typically less than width to account for overlap.
+    /// Calculated as: width - height × (1 - π/4)
+    pub perimeter_spacing: CoordF,
+
+    /// Spacing for external perimeters (mm).
+    pub external_perimeter_spacing: CoordF,
+
+    /// Spacing between external and first internal perimeter (mm).
+    /// This is the average of external and internal spacing.
+    pub external_to_internal_spacing: CoordF,
+
+    /// Layer height (mm) - needed for spacing calculations.
+    pub layer_height: CoordF,
 
     /// Whether to print external perimeters first (outside-in).
     pub external_perimeters_first: bool,
@@ -72,16 +86,60 @@ pub struct PerimeterConfig {
 
 impl Default for PerimeterConfig {
     fn default() -> Self {
+        Self::new(0.45, 0.45, 0.2, 3)
+    }
+}
+
+impl PerimeterConfig {
+    /// Create a new perimeter configuration with proper spacing calculations.
+    ///
+    /// # Arguments
+    /// * `perimeter_width` - Width of internal perimeters (mm)
+    /// * `external_width` - Width of external perimeters (mm)
+    /// * `layer_height` - Layer height (mm)
+    /// * `perimeter_count` - Number of perimeters to generate
+    pub fn new(
+        perimeter_width: CoordF,
+        external_width: CoordF,
+        layer_height: CoordF,
+        perimeter_count: usize,
+    ) -> Self {
+        // Calculate spacing using the Flow module's formula:
+        // spacing = width - height × (1 - π/4)
+        let perimeter_spacing =
+            Flow::rounded_rectangle_extrusion_spacing(perimeter_width, layer_height)
+                .unwrap_or(perimeter_width * 0.9);
+
+        let external_perimeter_spacing =
+            Flow::rounded_rectangle_extrusion_spacing(external_width, layer_height)
+                .unwrap_or(external_width * 0.9);
+
+        // Spacing between external and first internal perimeter
+        // BambuStudio uses: 0.5 × (ext_spacing + internal_spacing)
+        let external_to_internal_spacing = 0.5 * (external_perimeter_spacing + perimeter_spacing);
+
         Self {
-            perimeter_count: 3,
-            perimeter_extrusion_width: 0.45,
-            external_perimeter_extrusion_width: 0.45,
+            perimeter_count,
+            perimeter_extrusion_width: perimeter_width,
+            external_perimeter_extrusion_width: external_width,
+            perimeter_spacing,
+            external_perimeter_spacing,
+            external_to_internal_spacing,
+            layer_height,
             external_perimeters_first: false,
             min_perimeter_area: 0.01, // 0.01 mm²
             gap_fill_threshold: 0.0,  // Disabled by default
             thin_walls: false,        // Disabled by default
             join_type: OffsetJoinType::Miter,
         }
+    }
+
+    /// Create a configuration with custom spacing values.
+    pub fn with_spacing(mut self, internal_spacing: CoordF, external_spacing: CoordF) -> Self {
+        self.perimeter_spacing = internal_spacing;
+        self.external_perimeter_spacing = external_spacing;
+        self.external_to_internal_spacing = 0.5 * (external_spacing + internal_spacing);
+        self
     }
 }
 
@@ -261,10 +319,6 @@ impl PerimeterGenerator {
         let mut current_area = slices.to_vec();
         Self::sort_expolygons_deterministic(&mut current_area);
 
-        // Perimeter spacing for gap detection
-        let perimeter_spacing = self.config.perimeter_extrusion_width;
-        let ext_perimeter_spacing = self.config.external_perimeter_extrusion_width;
-
         // Whether to detect gaps (enabled when gap_fill_threshold > 0)
         let detect_gap_fill = self.config.gap_fill_threshold > 0.0;
 
@@ -272,26 +326,34 @@ impl PerimeterGenerator {
         for perimeter_idx in 0..self.config.perimeter_count {
             let is_external = perimeter_idx == 0;
 
-            // Calculate the offset distance for this perimeter
+            // Calculate the extrusion width for this perimeter
             let extrusion_width = if is_external {
                 self.config.external_perimeter_extrusion_width
             } else {
                 self.config.perimeter_extrusion_width
             };
 
-            // First perimeter: offset by half width to get centerline at the edge
-            // Subsequent perimeters: offset by full width
+            // Calculate the offset distance for this perimeter
+            // BambuStudio uses different calculations for each perimeter level:
+            // - External (i=0): offset by half external width
+            // - First internal (i=1): offset by external_to_internal_spacing
+            // - Subsequent internal (i>1): offset by perimeter_spacing
             let offset_distance = if perimeter_idx == 0 {
-                extrusion_width / 2.0
+                // External perimeter: offset by half width to get centerline at edge
+                self.config.external_perimeter_extrusion_width / 2.0
+            } else if perimeter_idx == 1 {
+                // First internal perimeter: use spacing between external and internal
+                self.config.external_to_internal_spacing
             } else {
-                extrusion_width
+                // Subsequent internal perimeters: use internal spacing
+                self.config.perimeter_spacing
             };
 
-            // Calculate spacing for gap detection (BambuStudio uses spacing, not width)
+            // Calculate spacing for gap detection
             let min_spacing = if is_external {
-                ext_perimeter_spacing
+                self.config.external_perimeter_spacing
             } else {
-                perimeter_spacing
+                self.config.perimeter_spacing
             };
 
             // Use offset2 for internal perimeters to enable proper gap detection
@@ -655,6 +717,34 @@ mod tests {
         let config = PerimeterConfig::default();
         assert_eq!(config.perimeter_count, 3);
         assert!((config.perimeter_extrusion_width - 0.45).abs() < 1e-6);
+        // Check that spacing is properly calculated (less than width)
+        assert!(config.perimeter_spacing < config.perimeter_extrusion_width);
+        assert!(config.perimeter_spacing > 0.0);
+    }
+
+    #[test]
+    fn test_perimeter_config_spacing() {
+        // Test that spacing is calculated correctly using Flow formula
+        let config = PerimeterConfig::new(0.45, 0.45, 0.2, 3);
+
+        // spacing = width - height × (1 - π/4) ≈ 0.45 - 0.2 × 0.2146 ≈ 0.407
+        let expected_spacing = 0.45 - 0.2 * (1.0 - 0.25 * std::f64::consts::PI);
+        assert!(
+            (config.perimeter_spacing - expected_spacing).abs() < 1e-6,
+            "Expected spacing ~{:.4}, got {:.4}",
+            expected_spacing,
+            config.perimeter_spacing
+        );
+
+        // External to internal spacing should be average
+        let expected_ext_to_int =
+            0.5 * (config.external_perimeter_spacing + config.perimeter_spacing);
+        assert!(
+            (config.external_to_internal_spacing - expected_ext_to_int).abs() < 1e-6,
+            "Expected ext_to_int spacing ~{:.4}, got {:.4}",
+            expected_ext_to_int,
+            config.external_to_internal_spacing
+        );
     }
 
     #[test]
