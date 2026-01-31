@@ -736,11 +736,176 @@ fn point_in_expolygons(pt: Point, expolygons: &[ExPolygon]) -> bool {
     false
 }
 
+/// Subtract polygons from polylines (polyline difference).
+///
+/// This returns the portions of the input polylines that fall OUTSIDE
+/// the given ExPolygons. This is the complement of `intersect_polylines_with_expolygons`.
+///
+/// In libslic3r, this is `diff_pl()`.
+///
+/// # Arguments
+/// * `polylines` - The polylines to clip
+/// * `clip` - The ExPolygons to subtract (portions outside these are kept)
+///
+/// # Returns
+/// A vector of polylines representing the portions outside the clip regions.
+pub fn diff_pl(polylines: &[Polyline], clip: &[ExPolygon]) -> Vec<Polyline> {
+    if polylines.is_empty() {
+        return vec![];
+    }
+
+    if clip.is_empty() {
+        // Nothing to subtract, return original polylines
+        return polylines.to_vec();
+    }
+
+    let mut result = Vec::new();
+
+    for polyline in polylines {
+        let clipped = diff_polyline_from_expolygons(polyline, clip);
+        result.extend(clipped);
+    }
+
+    result
+}
+
+/// Subtract ExPolygons from a single polyline.
+/// Returns the portions of the polyline that are OUTSIDE all clip regions.
+fn diff_polyline_from_expolygons(polyline: &Polyline, clip: &[ExPolygon]) -> Vec<Polyline> {
+    let points = polyline.points();
+    if points.len() < 2 {
+        return vec![];
+    }
+
+    let mut result = Vec::new();
+    let mut current_segment: Vec<Point> = Vec::new();
+
+    // Process each segment of the polyline
+    for i in 0..points.len() - 1 {
+        let p1 = points[i];
+        let p2 = points[i + 1];
+
+        // Find all portions of this segment that are outside clip regions
+        let outside_segments = diff_segment_from_expolygons(p1, p2, clip);
+
+        for segment in outside_segments {
+            if segment.len() >= 2 {
+                // Try to connect to current segment
+                if !current_segment.is_empty() {
+                    let last = *current_segment.last().unwrap();
+                    let first = segment[0];
+                    // Check if segments are connected (within tolerance)
+                    if (last.x - first.x).abs() <= 1 && (last.y - first.y).abs() <= 1 {
+                        // Connected, extend current segment
+                        current_segment.extend(segment.into_iter().skip(1));
+                    } else {
+                        // Not connected, save current and start new
+                        if current_segment.len() >= 2 {
+                            result.push(Polyline::from_points(current_segment));
+                        }
+                        current_segment = segment;
+                    }
+                } else {
+                    current_segment = segment;
+                }
+            }
+        }
+    }
+
+    // Don't forget the last segment
+    if current_segment.len() >= 2 {
+        result.push(Polyline::from_points(current_segment));
+    }
+
+    result
+}
+
+/// Get the portions of a line segment that are OUTSIDE all ExPolygons.
+fn diff_segment_from_expolygons(p1: Point, p2: Point, clip: &[ExPolygon]) -> Vec<Vec<Point>> {
+    let dx = p2.x - p1.x;
+    let dy = p2.y - p1.y;
+    let len_sq = dx as f64 * dx as f64 + dy as f64 * dy as f64;
+
+    if len_sq < 1.0 {
+        // Segment too short - check if it's outside
+        if !point_in_expolygons(p1, clip) {
+            return vec![vec![p1, p2]];
+        }
+        return vec![];
+    }
+
+    let len = len_sq.sqrt();
+    let step = 100_000i64; // 0.1mm sampling step
+    let num_samples = ((len / step as f64).ceil() as usize).max(2);
+
+    let mut result = Vec::new();
+    let mut current_segment: Vec<Point> = Vec::new();
+    let mut last_outside = false;
+
+    for i in 0..=num_samples {
+        let t = i as f64 / num_samples as f64;
+        let px = p1.x as f64 + dx as f64 * t;
+        let py = p1.y as f64 + dy as f64 * t;
+        let pt = Point::new(px.round() as i64, py.round() as i64);
+
+        // Check if point is OUTSIDE all clip regions
+        let outside = !point_in_expolygons(pt, clip);
+
+        if outside {
+            if !last_outside && !current_segment.is_empty() {
+                // Was inside, now outside - save previous segment if any
+                if current_segment.len() >= 2 {
+                    result.push(current_segment);
+                }
+                current_segment = Vec::new();
+            }
+            current_segment.push(pt);
+        } else {
+            if last_outside && !current_segment.is_empty() {
+                // Was outside, now inside
+                if current_segment.len() >= 2 {
+                    result.push(current_segment);
+                }
+                current_segment = Vec::new();
+            }
+        }
+        last_outside = outside;
+    }
+
+    // Save final segment
+    if current_segment.len() >= 2 {
+        result.push(current_segment);
+    }
+
+    result
+}
+
+/// Convert polygons to polylines (open paths).
+/// Each polygon becomes a polyline with the same points (not closed).
+pub fn polygons_to_polylines(polygons: &[Polygon]) -> Vec<Polyline> {
+    polygons
+        .iter()
+        .map(|p| Polyline::from_points(p.points().to_vec()))
+        .collect()
+}
+
+/// Convert ExPolygons to polylines (contours and holes as separate polylines).
+pub fn expolygons_to_polylines(expolygons: &[ExPolygon]) -> Vec<Polyline> {
+    let mut result = Vec::new();
+    for expoly in expolygons {
+        result.push(Polyline::from_points(expoly.contour.points().to_vec()));
+        for hole in &expoly.holes {
+            result.push(Polyline::from_points(hole.points().to_vec()));
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::geometry::Point;
-    use crate::Coord;
+    use crate::{scale, Coord};
 
     fn make_square(x: Coord, y: Coord, size: Coord) -> ExPolygon {
         let poly = Polygon::rectangle(Point::new(x, y), Point::new(x + size, y + size));
@@ -1066,5 +1231,96 @@ mod tests {
     fn test_offset2_empty_input() {
         let result = offset2(&[], 1.0, 1.0, OffsetJoinType::Round);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_diff_pl_empty_polylines() {
+        let polylines: Vec<Polyline> = Vec::new();
+        let clip = vec![make_square_mm(0.0, 0.0, 10.0)];
+        let result = diff_pl(&polylines, &clip);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_diff_pl_empty_clip() {
+        let pts = vec![
+            Point::new(scale(0.0), scale(0.0)),
+            Point::new(scale(10.0), scale(0.0)),
+        ];
+        let polylines = vec![Polyline::from_points(pts)];
+        let clip: Vec<ExPolygon> = Vec::new();
+
+        let result = diff_pl(&polylines, &clip);
+        // With no clip regions, original polylines should be returned
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_diff_pl_line_outside_clip() {
+        // Line completely outside the clip region
+        let pts = vec![
+            Point::new(scale(50.0), scale(50.0)),
+            Point::new(scale(60.0), scale(50.0)),
+        ];
+        let polylines = vec![Polyline::from_points(pts)];
+        let clip = vec![make_square_mm(0.0, 0.0, 10.0)];
+
+        let result = diff_pl(&polylines, &clip);
+        // Line is outside, should be kept
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_diff_pl_line_inside_clip() {
+        // Line completely inside the clip region
+        let pts = vec![
+            Point::new(scale(2.0), scale(2.0)),
+            Point::new(scale(8.0), scale(2.0)),
+        ];
+        let polylines = vec![Polyline::from_points(pts)];
+        let clip = vec![make_square_mm(0.0, 0.0, 10.0)];
+
+        let result = diff_pl(&polylines, &clip);
+        // Line is inside, should be removed (empty result)
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_polygons_to_polylines() {
+        let square = Polygon::rectangle(
+            Point::new(scale(0.0), scale(0.0)),
+            Point::new(scale(10.0), scale(10.0)),
+        );
+        let polygons = vec![square];
+
+        let result = polygons_to_polylines(&polygons);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].len() >= 4); // At least 4 points for a rectangle
+    }
+
+    #[test]
+    fn test_polygons_to_polylines_empty() {
+        let polygons: Vec<Polygon> = Vec::new();
+        let result = polygons_to_polylines(&polygons);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_expolygons_to_polylines_with_holes() {
+        // Create an expolygon with a hole
+        let outer = Polygon::rectangle(
+            Point::new(scale(0.0), scale(0.0)),
+            Point::new(scale(20.0), scale(20.0)),
+        );
+        let hole = Polygon::rectangle(
+            Point::new(scale(5.0), scale(5.0)),
+            Point::new(scale(15.0), scale(15.0)),
+        );
+        let expoly = ExPolygon::with_holes(outer, vec![hole]);
+        let expolygons = vec![expoly];
+
+        let result = expolygons_to_polylines(&expolygons);
+        // Should have 2 polylines: one for outer contour, one for hole
+        assert_eq!(result.len(), 2);
     }
 }

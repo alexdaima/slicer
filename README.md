@@ -4,14 +4,18 @@ This project is currently just an fun experiment to see how well AI can handle a
 
 This work is based on BambuStudio by BambuLab, which is based on PrusaSlicer by Prusa Research, which is from Slic3r by Alessandro Ranellucci and the RepRap community.
 
-Current validation score: **50.2/100**
+Current validation score: **55.0/100**
 
 ```bash
 Rust vs C++ Comparison:
   Files:                                    71 /      475  (14.9%)
-  Total lines:                           65164 /   243426  (26.7%)
-  Code lines (non-blank/comment):        45379 /   186433  (24.3%)
+  Total lines:                           65689 /   243426  (26.9%)
+  Code lines (non-blank/comment):        45712 /   186433  (24.5%)
 ```
+
+G-code line counts (3DBenchy):
+- Rust slicer: 392,617 lines
+- BambuStudio reference: 132,424 lines
 
 ## Current Status
 
@@ -311,7 +315,19 @@ env_logger = "0.10"
 |--------|----------------------|-------------|--------|
 | Layers | 240 | 240 | ✅ Exact match |
 | Filament | 3869mm | ~3640mm | ✅ Within 6% |
-| G-code | - | ~431K lines | ✅ Valid output |
+| G-code | 132K lines | ~393K lines | 🔄 Working on parity |
+
+### Feature Comparison (Current)
+
+| Feature | Reference | Generated | Status |
+|---------|-----------|-----------|--------|
+| Bridge Infill | 1,536 moves | 16 moves | 🔴 Under-detection |
+| External Perimeter | 28,702 moves | 205,316 moves | 🔴 Over-generation |
+| Internal Perimeter | 10,318 moves | 152,428 moves | 🔴 Over-generation |
+| Solid Infill | 9,810 moves | 998 moves | 🔴 Under-generation |
+| Sparse Infill | 11,504 moves | 13,029 moves | 🟡 Close |
+| Travel | 29,736 moves | 17,939 moves | 🟡 Different |
+| Wipe | 3,099 moves | - | 🔴 Not implemented |
 
 ### G-code Comparison Strategy
 1. **Structural comparison**: Same number of layers ✅

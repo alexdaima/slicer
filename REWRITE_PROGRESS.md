@@ -2,7 +2,7 @@
 
 Comprehensive tracking document for the BambuStudio/libslic3r → Rust rewrite.
 
-**Last Updated:** 2025-01-24 (Session 31)
+**Last Updated:** 2025-01-25 (Session 34)
 
 ---
 
@@ -559,6 +559,71 @@ approx = "0.5"              # Float comparisons in tests
 3. **MEDIUM: Tune solid infill generation** - over-generating by 2.6×
 4. **MEDIUM: Add wipe feature** - missing entirely
 5. **LOW: Fix first layer height** - Z offset mismatch
+
+### 2025-01-25 (Session 34) - Bridge Detection Improvements
+
+**Major Bridge Detection Overhaul:**
+- Implemented proper polyline-polygon operations in `clipper/mod.rs`:
+  - Added `diff_pl()` - polyline difference (subtract polygons from polylines)
+  - Added `polygons_to_polylines()` - convert polygons to open polylines
+  - Added `expolygons_to_polylines()` - convert expolygons to polylines (contours + holes)
+  - These mirror libslic3r's `diff_pl()` and `to_polylines()` functions
+
+- Improved bridge anchor and edge detection in `bridge/mod.rs`:
+  - Fixed `BridgeDetector::initialize()` to use proper clipper intersection
+  - Uses `intersect_polylines_with_expolygons()` for accurate edge detection
+  - Added safety offset (10 microns) for numerical stability
+  - Improved documentation matching libslic3r's algorithm
+
+- Added anchor-based bridge direction detection:
+  - New `detect_bridge_direction_from_anchors()` function
+  - Implements libslic3r's `detect_bridging_direction(Polygons, Polygons)` algorithm
+  - Computes overhang area as difference between bridge and anchors
+  - Finds floating edges (edges not touching expanded anchors)
+  - Selects direction that minimizes floating edge length perpendicular to bridge
+
+- Updated bridge detection fallback logic:
+  - When `BridgeDetector::detect_angle()` fails (no anchors), uses anchor-based detection
+  - Falls back to principal components for completely floating regions
+  - Always produces a valid bridge angle (no more -1.0 angle values)
+
+- Pipeline improvements in `pipeline/mod.rs`:
+  - Updated `detect_and_separate_bridges_improved()` to use new detection
+  - Uses `detect_bridge_direction_from_anchors()` when standard detection fails
+  - Better handling of bridges that span between walls
+
+**New Tests Added (14 tests):**
+- Bridge detection tests:
+  - `test_detect_bridge_direction_from_anchors_no_anchors`
+  - `test_detect_bridge_direction_from_anchors_full_anchor`
+  - `test_detect_bridge_direction_from_anchors_partial`
+  - `test_detect_bridge_direction_rectangular_bridge`
+  - `test_polylines_to_lines`
+  - `test_polylines_to_lines_empty`
+  - `test_polylines_to_lines_single_point`
+
+- Clipper polyline operation tests:
+  - `test_diff_pl_empty_polylines`
+  - `test_diff_pl_empty_clip`
+  - `test_diff_pl_line_outside_clip`
+  - `test_diff_pl_line_inside_clip`
+  - `test_polygons_to_polylines`
+  - `test_polygons_to_polylines_empty`
+  - `test_expolygons_to_polylines_with_holes`
+
+**Files Changed:**
+- `clipper/mod.rs` - Added diff_pl, polygons_to_polylines, expolygons_to_polylines
+- `bridge/mod.rs` - Major refactor of bridge detection algorithm
+- `pipeline/mod.rs` - Updated bridge detection integration
+
+**Test Status:** 1024 tests passing (+14 new tests)
+
+**Remaining Issues (Priority Order):**
+1. **Bridge Detection** - Improved algorithm, needs validation testing
+2. **Internal Perimeters** - Still ~4× reference count
+3. **Solid Infill** - Over-generating by 2.6×
+4. **Wipe Feature** - Missing entirely
+5. **First Layer Height** - Z offset mismatch
 
 ### 2025-01-31 (Session 32) - Surface Classification & Perimeter Spacing Improvements
 

@@ -24,10 +24,14 @@
 //!
 //! This implementation mirrors BambuStudio/src/libslic3r/BridgeDetector.cpp
 
-use crate::clipper::{self, OffsetJoinType};
+use crate::clipper::{self, diff_pl, intersect_polylines_with_expolygons, OffsetJoinType};
 use crate::geometry::{ExPolygon, ExPolygons, Line, Point, PointF, Polygon, Polyline};
 use crate::{scale, unscale, Coord, CoordF};
 use std::f64::consts::PI;
+
+/// Minimum area for a region to be considered a bridge (in scaled units squared).
+/// This is approximately 0.5 mm² at our scaling factor.
+const MIN_BRIDGE_AREA_SCALED: f64 = 0.5 * crate::SCALING_FACTOR * crate::SCALING_FACTOR;
 
 /// Type alias for a collection of polylines.
 pub type Polylines = Vec<Polyline>;
@@ -204,27 +208,53 @@ impl BridgeDetector {
     }
 
     /// Initialize the detector by finding anchors and edges.
+    ///
+    /// This mirrors libslic3r's BridgeDetector::initialize():
+    /// 1. Outset the bridge region by the extrusion spacing
+    /// 2. Find anchoring edges by intersecting the grown contour with lower slice contours
+    /// 3. Find anchor regions as intersection of grown bridge with lower slices
     fn initialize(&mut self) {
+        if self.lower_slices.is_empty() {
+            // No lower slices means completely floating - no anchors possible
+            return;
+        }
+
         // Outset the bridge by spacing amount for detecting anchors
+        // This matches libslic3r: offset(this->expolygons, float(this->spacing))
         let grown = clipper::offset_expolygons(
             &self.expolygons,
             unscale(self.spacing),
             OffsetJoinType::Square,
         );
 
-        // Detect anchoring edges by clipping grown contour against lower slice contours
+        if grown.is_empty() {
+            return;
+        }
+
+        // Detect anchoring edges by clipping grown contour against lower slice contours.
+        // In libslic3r: intersection_pl(to_polylines(grown), contours)
+        // We use the lower slices directly (contours only, not holes) for edge detection.
         let grown_polylines = expolygons_to_polylines(&grown);
-        let lower_contours: Vec<Polygon> = self
+
+        // Convert lower slice contours to ExPolygons for proper clipping
+        // We only want the outer contours for edge detection (where bridge connects to walls)
+        let lower_contour_expolygons: ExPolygons = self
             .lower_slices
             .iter()
-            .map(|ex| ex.contour.clone())
+            .map(|ex| ExPolygon::new(ex.contour.clone()))
             .collect();
-        self.edges = intersection_polylines_polygons(&grown_polylines, &lower_contours);
 
-        // Detect anchor regions as intersection of grown bridge with lower slices
-        // Use a small safety offset to avoid numerical issues
+        // Use proper clipper intersection for polylines
+        self.edges =
+            intersect_polylines_with_expolygons(&grown_polylines, &lower_contour_expolygons);
+
+        // Detect anchor regions as intersection of grown bridge with lower slices.
+        // In libslic3r: intersection_ex(grown, union_safety_offset(this->lower_slices))
+        // Use a small safety offset to avoid numerical issues at exact boundaries.
         let lower_union = clipper::union_ex(&self.lower_slices);
-        let lower_offset = clipper::offset_expolygons(&lower_union, 0.001, OffsetJoinType::Square);
+        let safety_offset = 0.01; // 10 microns safety offset
+        let lower_offset =
+            clipper::offset_expolygons(&lower_union, safety_offset, OffsetJoinType::Square);
         self.anchor_regions = clipper::intersection(&grown, &lower_offset);
     }
 
@@ -235,9 +265,16 @@ impl BridgeDetector {
     ///
     /// # Returns
     /// `true` if a valid angle was found, `false` if the bridge is unsupported
+    ///
+    /// Note: When this returns `false`, the bridge is completely in the air with no
+    /// anchors. The caller should still generate bridge infill with a default angle
+    /// (typically 0 or based on principal components of the bridge shape).
     pub fn detect_angle(&mut self, bridge_direction_override: CoordF) -> bool {
         if self.edges.is_empty() || self.anchor_regions.is_empty() {
-            // The bridging region is completely in the air
+            // The bridging region is completely in the air, there are no anchors
+            // available at the layer below. This matches libslic3r behavior.
+            // The caller should use a fallback angle (e.g., from principal components
+            // or just 0 degrees).
             return false;
         }
 
@@ -489,6 +526,9 @@ impl BridgeDetector {
 ///
 /// # Returns
 /// Vector of detected bridges with their optimal directions.
+///
+/// Note: Bridges with no anchors (completely floating) will still have an angle
+/// computed using principal components or the anchor-based direction detection.
 pub fn detect_bridges(
     layer_polygons: &ExPolygons,
     lower_layer_polygons: &ExPolygons,
@@ -498,30 +538,52 @@ pub fn detect_bridges(
         return Vec::new();
     }
 
-    // Find unsupported areas
+    // Find unsupported areas (areas in current layer not supported by layer below)
     let unsupported = if lower_layer_polygons.is_empty() {
+        // No lower layer means everything is unsupported (floating or first layer)
         layer_polygons.clone()
     } else {
         clipper::difference(layer_polygons, lower_layer_polygons)
     };
 
-    let min_area = 1.0 * crate::SCALING_FACTOR * crate::SCALING_FACTOR;
-
     let mut bridges = Vec::new();
 
     for expoly in unsupported {
-        if expoly.area().abs() < min_area {
+        // Skip very small regions that are likely artifacts
+        if expoly.area().abs() < MIN_BRIDGE_AREA_SCALED {
             continue;
         }
 
         let mut detector = BridgeDetector::new(expoly.clone(), lower_layer_polygons, spacing);
 
-        let mut bridge = Bridge::new(expoly);
+        let mut bridge = Bridge::new(expoly.clone());
         bridge.anchor_regions = detector.anchor_regions.clone();
         bridge.edges = detector.edges.clone();
 
         if detector.detect_angle(0.0) {
+            // Successfully detected angle with anchors using BridgeDetector
             bridge.angle = detector.angle;
+            bridge.coverage = detector.angle; // Store for diagnostics
+        } else {
+            // BridgeDetector failed (no anchors found)
+            // Use the anchor-based direction detection from libslic3r
+            let to_cover = vec![expoly.contour.clone()];
+            let anchors: Vec<Polygon> = lower_layer_polygons
+                .iter()
+                .map(|ex| ex.contour.clone())
+                .collect();
+
+            let (dir, _cost) = detect_bridge_direction_from_anchors(&to_cover, &anchors);
+
+            // Convert direction vector to angle
+            bridge.angle = dir.y.atan2(dir.x);
+            if bridge.angle < 0.0 {
+                bridge.angle += PI;
+            }
+            // Normalize to [0, PI) range
+            while bridge.angle >= PI {
+                bridge.angle -= PI;
+            }
         }
 
         bridges.push(bridge);
@@ -530,10 +592,92 @@ pub fn detect_bridges(
     bridges
 }
 
-/// Detect the optimal bridging direction using principal component analysis.
+/// Detect the optimal bridging direction using the anchor-based approach from libslic3r.
 ///
-/// This is an alternative method used when standard bridge detection fails.
-/// It finds the direction that minimizes unsupported line endpoints.
+/// This is the main bridge direction detection function that:
+/// 1. Computes the overhang area (to_cover - anchors_area)
+/// 2. Finds floating edges (edges of overhang not touching anchors)
+/// 3. Selects the direction that minimizes floating edge length perpendicular to bridge
+///
+/// This mirrors libslic3r's `detect_bridging_direction(Polygons &to_cover, Polygons &anchors_area)`.
+///
+/// # Arguments
+/// * `to_cover` - The polygons to bridge over
+/// * `anchors_area` - The anchor regions (solid areas on layer below)
+///
+/// # Returns
+/// (direction_vector, unsupported_distance)
+pub fn detect_bridge_direction_from_anchors(
+    to_cover: &[Polygon],
+    anchors_area: &[Polygon],
+) -> (PointF, CoordF) {
+    // Compute overhang area = to_cover - anchors_area
+    let to_cover_ex: ExPolygons = to_cover.iter().map(|p| ExPolygon::new(p.clone())).collect();
+    let anchors_ex: ExPolygons = anchors_area
+        .iter()
+        .map(|p| ExPolygon::new(p.clone()))
+        .collect();
+
+    let overhang_area = clipper::difference(&to_cover_ex, &anchors_ex);
+
+    if overhang_area.is_empty() {
+        // Fully anchored, use principal components
+        if let Some((_, pc2)) = compute_principal_components(to_cover) {
+            if pc2.x != 0.0 || pc2.y != 0.0 {
+                let len = (pc2.x * pc2.x + pc2.y * pc2.y).sqrt();
+                return (PointF::new(pc2.x / len, pc2.y / len), 0.0);
+            }
+        }
+        return (PointF::new(1.0, 0.0), 0.0);
+    }
+
+    // Get polylines of overhang boundary
+    let overhang_polylines = expolygons_to_polylines(&overhang_area);
+
+    // Expand anchors slightly for floating edge detection
+    let anchors_expanded = clipper::offset_expolygons(&anchors_ex, 0.001, OffsetJoinType::Square); // ~1 micron
+
+    // Find floating edges = portions of overhang boundary NOT touching expanded anchors
+    let floating_polylines = diff_pl(&overhang_polylines, &anchors_expanded);
+
+    if floating_polylines.is_empty() {
+        // Fully anchored from all sides - use principal components for shortest direction
+        let overhang_polygons: Vec<Polygon> =
+            overhang_area.iter().map(|ex| ex.contour.clone()).collect();
+        if let Some((_, pc2)) = compute_principal_components(&overhang_polygons) {
+            if pc2.x != 0.0 || pc2.y != 0.0 {
+                let len = (pc2.x * pc2.x + pc2.y * pc2.y).sqrt();
+                return (PointF::new(pc2.x / len, pc2.y / len), 0.0);
+            }
+        }
+        return (PointF::new(1.0, 0.0), 0.0);
+    }
+
+    // Convert floating polylines to lines
+    let floating_edges: Vec<Line> = polylines_to_lines(&floating_polylines);
+
+    // Now find direction that minimizes floating edge length
+    detect_bridging_direction(&floating_edges, to_cover)
+}
+
+/// Convert polylines to individual line segments.
+fn polylines_to_lines(polylines: &[Polyline]) -> Vec<Line> {
+    let mut lines = Vec::new();
+    for polyline in polylines {
+        let pts = polyline.points();
+        for i in 0..pts.len().saturating_sub(1) {
+            lines.push(Line::new(pts[i], pts[i + 1]));
+        }
+    }
+    lines
+}
+
+/// Detect the optimal bridging direction using floating edges.
+///
+/// This finds the direction that minimizes unsupported (floating) edge length
+/// perpendicular to the bridge direction.
+///
+/// This mirrors libslic3r's detect_bridging_direction(Lines, Polygons) function.
 ///
 /// # Arguments
 /// * `floating_edges` - Lines representing unsupported edges
@@ -734,31 +878,19 @@ fn point_in_expolygons(point: &Point, expolygons: &ExPolygons) -> bool {
     false
 }
 
-/// Intersect polylines with polygons.
+/// Intersect polylines with polygons using proper clipper operations.
+/// This is a wrapper that uses the clipper module's intersect_polylines_with_expolygons.
+#[allow(dead_code)]
 fn intersection_polylines_polygons(polylines: &Polylines, polygons: &[Polygon]) -> Polylines {
-    // Convert to expolygons for clipper
-    let clip_expolygons: ExPolygons = polygons.iter().map(|p| ExPolygon::new(p.clone())).collect();
-
-    let mut result = Vec::new();
-
-    for polyline in polylines {
-        let pts = polyline.points();
-        // Simple line-by-line clipping
-        for i in 0..polyline.len().saturating_sub(1) {
-            let line = Line::new(pts[i], pts[i + 1]);
-
-            // Check if line segment intersects with any polygon
-            for expoly in &clip_expolygons {
-                if line_intersects_polygon(&line, &expoly.contour) {
-                    // For simplicity, just include the whole segment if it intersects
-                    result.push(Polyline::from_points(vec![line.a, line.b]));
-                    break;
-                }
-            }
-        }
+    if polylines.is_empty() || polygons.is_empty() {
+        return Vec::new();
     }
 
-    result
+    // Convert polygons to expolygons for clipper
+    let clip_expolygons: ExPolygons = polygons.iter().map(|p| ExPolygon::new(p.clone())).collect();
+
+    // Use the proper clipper-based intersection
+    intersect_polylines_with_expolygons(polylines, &clip_expolygons)
 }
 
 /// Subtract polygons from polylines.
@@ -805,6 +937,7 @@ fn intersection_lines_polygons(lines: &[Line], polygons: &[Polygon]) -> Vec<Line
 }
 
 /// Check if a line intersects a polygon.
+#[allow(dead_code)]
 fn line_intersects_polygon(line: &Line, polygon: &Polygon) -> bool {
     let expoly = ExPolygon::new(polygon.clone());
 
@@ -826,6 +959,7 @@ fn line_intersects_polygon(line: &Line, polygon: &Polygon) -> bool {
 }
 
 /// Check if two line segments intersect.
+#[allow(dead_code)]
 fn lines_intersect(l1: &Line, l2: &Line) -> bool {
     let d1 = cross_product_sign(&l2.a, &l2.b, &l1.a);
     let d2 = cross_product_sign(&l2.a, &l2.b, &l1.b);
@@ -853,6 +987,7 @@ fn lines_intersect(l1: &Line, l2: &Line) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn cross_product_sign(a: &Point, b: &Point, c: &Point) -> i64 {
     let v1x = b.x - a.x;
     let v1y = b.y - a.y;
@@ -869,6 +1004,7 @@ fn cross_product_sign(a: &Point, b: &Point, c: &Point) -> i64 {
     }
 }
 
+#[allow(dead_code)]
 fn on_segment(a: &Point, b: &Point, c: &Point) -> bool {
     b.x >= a.x.min(c.x) && b.x <= a.x.max(c.x) && b.y >= a.y.min(c.y) && b.y <= a.y.max(c.y)
 }
@@ -1764,5 +1900,115 @@ mod tests {
             assert!(angle >= 0.0);
             assert!(angle <= PI + 0.01); // Allow small floating point error
         }
+    }
+
+    // ========================================================================
+    // Anchor-based Bridge Direction Detection Tests
+    // ========================================================================
+
+    #[test]
+    fn test_detect_bridge_direction_from_anchors_no_anchors() {
+        // Bridge with no anchors - should use principal components
+        let to_cover = vec![make_square_mm(10.0).contour];
+        let anchors: Vec<Polygon> = Vec::new();
+
+        let (dir, cost) = detect_bridge_direction_from_anchors(&to_cover, &anchors);
+
+        // For a square with no anchors, any direction is acceptable
+        // Just verify we get a valid direction vector
+        let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
+        assert!((len - 1.0).abs() < 0.01, "Direction should be normalized");
+        assert!(cost >= 0.0);
+    }
+
+    #[test]
+    fn test_detect_bridge_direction_from_anchors_full_anchor() {
+        // Bridge fully covered by anchors
+        let square = make_square_mm(10.0);
+        let to_cover = vec![square.contour.clone()];
+
+        // Anchor is the same size - fully anchored
+        let anchors = vec![square.contour];
+
+        let (dir, _cost) = detect_bridge_direction_from_anchors(&to_cover, &anchors);
+
+        // For fully anchored, should use principal components
+        let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
+        assert!((len - 1.0).abs() < 0.01, "Direction should be normalized");
+    }
+
+    #[test]
+    fn test_detect_bridge_direction_from_anchors_partial() {
+        // Bridge partially anchored - like spanning between two walls
+        let bridge = make_rect_mm(20.0, 5.0); // Wide bridge
+        let to_cover = vec![bridge.contour.clone()];
+
+        // Create anchor on one side (left wall)
+        let left_anchor = Polygon::rectangle(
+            Point::new(scale(-15.0), scale(-5.0)),
+            Point::new(scale(-10.0), scale(10.0)),
+        );
+
+        // Create anchor on the other side (right wall)
+        let right_anchor = Polygon::rectangle(
+            Point::new(scale(10.0), scale(-5.0)),
+            Point::new(scale(15.0), scale(10.0)),
+        );
+
+        let anchors = vec![left_anchor, right_anchor];
+
+        let (dir, _cost) = detect_bridge_direction_from_anchors(&to_cover, &anchors);
+
+        // Direction should be valid
+        let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
+        assert!((len - 1.0).abs() < 0.01, "Direction should be normalized");
+    }
+
+    #[test]
+    fn test_detect_bridge_direction_rectangular_bridge() {
+        // Test that a rectangular bridge detects reasonable direction
+        let bridge = make_rect_mm(30.0, 5.0); // Long narrow bridge
+        let to_cover = vec![bridge.contour];
+        let anchors: Vec<Polygon> = Vec::new();
+
+        let (dir, _cost) = detect_bridge_direction_from_anchors(&to_cover, &anchors);
+
+        // For a long narrow rectangle, direction should prefer bridging
+        // perpendicular to the long axis (along the short axis)
+        // or along the long axis - both are valid depending on algorithm
+        let len = (dir.x * dir.x + dir.y * dir.y).sqrt();
+        assert!((len - 1.0).abs() < 0.01, "Direction should be normalized");
+    }
+
+    #[test]
+    fn test_polylines_to_lines() {
+        let pts = vec![Point::new(0, 0), Point::new(100, 0), Point::new(100, 100)];
+        let polyline = Polyline::from_points(pts);
+        let polylines = vec![polyline];
+
+        let lines = polylines_to_lines(&polylines);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].a, Point::new(0, 0));
+        assert_eq!(lines[0].b, Point::new(100, 0));
+        assert_eq!(lines[1].a, Point::new(100, 0));
+        assert_eq!(lines[1].b, Point::new(100, 100));
+    }
+
+    #[test]
+    fn test_polylines_to_lines_empty() {
+        let polylines: Vec<Polyline> = Vec::new();
+        let lines = polylines_to_lines(&polylines);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_polylines_to_lines_single_point() {
+        let pts = vec![Point::new(0, 0)];
+        let polyline = Polyline::from_points(pts);
+        let polylines = vec![polyline];
+
+        let lines = polylines_to_lines(&polylines);
+        assert!(lines.is_empty()); // Single point can't form a line
     }
 }

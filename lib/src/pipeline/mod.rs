@@ -29,7 +29,7 @@
 //! gcode.write_to_file("output.gcode")?;
 //! ```
 
-use crate::bridge::{BridgeConfig, BridgeDetector};
+use crate::bridge::{detect_bridge_direction_from_anchors, BridgeConfig, BridgeDetector};
 use crate::config::{
     InfillPattern as ConfigInfillPattern, PerimeterMode, PrintConfig, PrintObjectConfig,
     SeamPosition as ConfigSeamPosition,
@@ -1112,17 +1112,40 @@ impl PrintPipeline {
             let mut detector =
                 BridgeDetector::new(bridge_expoly.clone(), lower_layer_slices, spacing);
 
-            // Try to detect optimal angle, use 0 if detection fails
+            // Try to detect optimal angle using BridgeDetector first
             let bridge_angle = if detector.detect_angle(0.0) {
                 detector.angle.to_degrees()
             } else {
-                // Check if we have a pre-detected angle from surfaces
-                surfaces
+                // BridgeDetector failed (no anchors found)
+                // First check if we have a pre-detected angle from surfaces
+                if let Some(angle) = surfaces
                     .iter()
                     .find(|s| s.is_bridge() && s.bridge_angle.is_some())
                     .and_then(|s| s.bridge_angle)
-                    .map(|a| a.to_degrees())
-                    .unwrap_or(0.0)
+                {
+                    angle.to_degrees()
+                } else {
+                    // Use the anchor-based direction detection from libslic3r
+                    // This handles bridges that span gaps between walls
+                    let to_cover = vec![bridge_expoly.contour.clone()];
+                    let anchors: Vec<crate::geometry::Polygon> = lower_layer_slices
+                        .iter()
+                        .map(|ex| ex.contour.clone())
+                        .collect();
+
+                    let (dir, _cost) = detect_bridge_direction_from_anchors(&to_cover, &anchors);
+
+                    // Convert direction vector to angle in degrees
+                    let mut angle = dir.y.atan2(dir.x);
+                    if angle < 0.0 {
+                        angle += std::f64::consts::PI;
+                    }
+                    // Normalize to [0, 180) range
+                    while angle >= std::f64::consts::PI {
+                        angle -= std::f64::consts::PI;
+                    }
+                    angle.to_degrees()
+                }
             };
 
             // Generate bridge infill at the optimal angle
