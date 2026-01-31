@@ -11,6 +11,7 @@ pub mod ironing;
 pub mod multi_material;
 mod path;
 pub mod pressure_equalizer;
+pub mod retract_crossing;
 pub mod seam_placer;
 pub mod spiral_vase;
 pub mod tool_ordering;
@@ -45,6 +46,7 @@ pub use path::{
     PathGenerator, SeamPosition,
 };
 pub use pressure_equalizer::{PressureEqualizer, PressureEqualizerConfig, PressureEqualizerStats};
+pub use retract_crossing::{RetractCrossingConfig, RetractDecision, RetractWhenCrossingPerimeters};
 pub use seam_placer::{
     create_seam_placer, place_seam, EnforcedBlockedSeamPoint, LayerOutline, LayerSeams, Perimeter,
     PerimeterOutline, Point3f, SeamCandidate, SeamPlacer, SeamPlacerConfig, SeamPlacerStats,

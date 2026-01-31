@@ -2,7 +2,7 @@
 
 Comprehensive tracking document for the BambuStudio/libslic3r → Rust rewrite.
 
-**Last Updated:** 2025-01-18 (Session 14)
+**Last Updated:** 2025-01-21 (Session 27)
 
 ---
 
@@ -136,14 +136,14 @@ slicer/
 | Geometry | 16 | 0 | 0 | 16 |
 | Perimeter | 6 | 0 | 1 | 7 |
 | Infill | 17 | 0 | 0 | 17 |
-| G-code | 18 | 0 | 0 | 18 |
+| G-code | 19 | 0 | 0 | 19 |
 | Support | 8 | 1 | 0 | 9 |
 | Adhesion | 4 | 0 | 0 | 4 |
 | Surface | 3 | 0 | 1 | 4 |
 | Advanced | 0 | 0 | 5 | 5 |
-| **Total** | **80** | **1** | **7** | **88** |
+| **Total** | **81** | **1** | **7** | **89** |
 
-**Overall Progress: ~91%**
+**Overall Progress: ~92%**
 
 ---
 
@@ -217,7 +217,7 @@ slicer/
 | Archimedean Chords | `infill/plan_path.rs` | `Fill/FillPlanePath.cpp` | ✅ |
 | Octagram Spiral | `infill/plan_path.rs` | `Fill/FillPlanePath.cpp` | ✅ |
 
-### G-code Generation ✅ (18/18)
+### G-code Generation ✅ (19/19)
 
 | Feature | File | BambuStudio Reference | Status |
 |---------|------|----------------------|:------:|
@@ -238,6 +238,7 @@ slicer/
 | Wipe Tower | `gcode/wipe_tower.rs` | `GCode/WipeTower.cpp` | ✅ |
 | Tool Ordering | `gcode/tool_ordering.rs` | `GCode/ToolOrdering.cpp` | ✅ |
 | Multi-Material Coordinator | `gcode/multi_material.rs` | `GCode.cpp` (integration) | ✅ |
+| Retract When Crossing | `gcode/retract_crossing.rs` | `GCode/RetractWhenCrossingPerimeters.cpp` | ✅ |
 
 ### Support Generation ✅ (8/9)
 
@@ -340,11 +341,11 @@ slicer/
 
 | Category | Passed | Failed | Ignored |
 |----------|:------:|:------:|:-------:|
-| Unit Tests | 873 | 0 | 0 |
-| Integration Tests | 71 | 0 | 4 |
+| Unit Tests | 900 | 0 | 0 |
+| Integration Tests | 75 | 0 | 4 |
 | Doc Tests | 1 | 0 | 5 |
 
-**Total: 944 tests passing**
+**Total: 975 tests passing**
 
 Note: Integration tests include:
 - `benchy_integration.rs` - Reference G-code comparison (20 pass, 4 ignored - data files may be missing)
@@ -478,6 +479,58 @@ approx = "0.5"              # Float comparisons in tests
 ---
 
 ## Changelog
+
+### 2025-01-21 (Session 27) - RetractWhenCrossingPerimeters
+
+**Implemented RetractWhenCrossingPerimeters Module:**
+- Created `gcode/retract_crossing.rs` with complete implementation
+- Determines whether to perform retraction when travel moves cross perimeter boundaries
+- Helps reduce stringing by retracting when the nozzle travels outside internal regions
+
+**Key Types:**
+- `RetractWhenCrossingPerimeters`: Main checker with layer caching for efficient queries
+- `RetractDecision`: Enum indicating whether to retract or not
+- `RetractCrossingConfig`: Configuration options for the feature
+
+**Algorithm:**
+1. Checks if travel path is entirely within internal regions (sparse infill areas)
+2. Checks if travel path crosses any perimeter lines
+3. If travel stays inside internal regions AND doesn't cross perimeters → skip retraction
+4. Otherwise → recommend retraction
+
+**Features:**
+- Layer-based caching of internal islands and perimeter lines
+- Bounding box acceleration for fast intersection rejection
+- Supports multiple internal regions per layer
+- Proper line segment intersection testing using cross product method
+
+**New Tests (17 tests):**
+- `test_retract_decision` - enum behavior
+- `test_new_instance` - initialization
+- `test_empty_travel` - empty path handling
+- `test_single_point_travel` - single point handling
+- `test_travel_outside_internal_regions` - outside regions → retract
+- `test_travel_inside_internal_region` - inside regions → no retract
+- `test_travel_crossing_boundary` - boundary crossing → retract
+- `test_layer_caching` - cache invalidation on layer change
+- `test_clear` - cache clearing
+- `test_lines_intersect_crossing` - line intersection detection
+- `test_lines_intersect_parallel` - parallel lines
+- `test_lines_intersect_no_intersection` - non-intersecting lines
+- `test_lines_intersect_endpoint` - endpoint touching
+- `test_config_default` - default configuration
+- `test_config_builder` - builder pattern
+- `test_empty_layer` - layer with no internal regions
+- `test_multiple_internal_regions` - multiple separate regions
+
+**libslic3r Reference:**
+- `src/libslic3r/GCode/RetractWhenCrossingPerimeters.cpp`
+- `src/libslic3r/GCode/RetractWhenCrossingPerimeters.hpp`
+
+**Impact on Validation Score:**
+- This feature can improve G-code parity by matching BambuStudio's retraction behavior
+- Reduces unnecessary retractions inside internal regions
+- Should reduce stringing artifacts in generated prints
 
 ### 2025-01-21 (Session 26) - G-code Validation Tool
 
