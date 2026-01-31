@@ -480,6 +480,61 @@ approx = "0.5"              # Float comparisons in tests
 
 ## Changelog
 
+### 2025-02-01 (Session 35) - Surface Polygon Simplification Before Perimeter Generation
+
+**Major Discovery & Fix:**
+Identified root cause of excessive G-code size (392K vs 132K reference lines):
+- BambuStudio simplifies surface polygons **before** perimeter generation
+- Our Rust slicer was passing high-resolution mesh slices directly to perimeters
+- Reference: `PerimeterGenerator.cpp` line 902, 933
+
+**Key Code Change in libslic3r:**
+```cpp
+// PerimeterGenerator.cpp line 902
+double surface_simplify_resolution = (print_config->enable_arc_fitting && 
+    this->config->fuzzy_skin == FuzzySkinType::None) ? 0.2 * m_scaled_resolution : m_scaled_resolution;
+
+// PerimeterGenerator.cpp line 933
+ExPolygons last = union_ex(surface.expolygon.simplify_p(surface_simplify_resolution));
+```
+
+**Implementation:**
+- Added `surface_simplify_resolution` field to `PerimeterConfig` (default: 0.01mm)
+- Added `arc_fitting_enabled` field to `PerimeterConfig` (affects resolution)
+- Added `simplify_expolygons()` method to `PerimeterGenerator`
+- Added `union_polygons_ex()` function to clipper module
+- Integrated simplification at start of `generate()` method
+
+**Results - MASSIVE IMPROVEMENT:**
+- G-code lines: **105,076** (was 392,617 - **73% reduction**, now 79% of reference)
+- External Perimeter: **25,655** moves (was 205,316 - now 89% of reference!)
+- Internal Perimeter: **27,743** moves (was 152,428 - reduced from 15× to 2.7× reference)
+- Solid Infill: **24,651** moves (was 998 - now generating properly)
+- Sparse Infill: **6,101** moves (was 13,029)
+
+**Quality Score:** 53.5/100 (slight decrease due to different infill balance)
+
+**Files Changed:**
+- `perimeter/mod.rs` - Added surface simplification, new config fields, helper method
+- `clipper/mod.rs` - Added `union_polygons_ex()` function
+- `pipeline/mod.rs` - Pass arc_fitting_enabled to perimeter config
+
+**Test Status:** 1025 tests passing (+1 new simplification test)
+
+**Key Insight:**
+The path simplification from Session 33 was being applied **after** perimeter generation
+on the G-code paths. BambuStudio applies simplification **before** perimeter generation
+on the surface polygons. Both are needed, but the surface simplification has the bigger
+impact because it reduces points before the polygon offset operations that generate perimeters.
+
+**Next Steps:**
+1. **HIGH: Bridge Detection** - Still severely under-detecting (20 vs 1,536 moves)
+2. **MEDIUM: Internal Perimeter** - Still 2.7× reference (improved from 15×)
+3. **MEDIUM: Solid/Sparse Infill Balance** - Ratios differ from reference
+4. **LOW: Wipe Moves** - Not implemented
+
+---
+
 ### 2025-02-01 (Session 33) - Path Simplification Implementation
 
 **Implemented Path Simplification Module:**

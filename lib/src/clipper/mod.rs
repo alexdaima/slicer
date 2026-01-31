@@ -213,6 +213,22 @@ pub fn union_ex(polygons: &[ExPolygon]) -> ExPolygons {
     result
 }
 
+/// Compute the union of raw Polygons into ExPolygons.
+/// This is used after simplification to reconstruct proper ExPolygons with holes.
+/// Equivalent to BambuStudio's union_ex(simplify_p(...))
+pub fn union_polygons_ex(polygons: &[Polygon]) -> ExPolygons {
+    if polygons.is_empty() {
+        return vec![];
+    }
+
+    // Use geo-clipper to union all polygons
+    let geo_multi = polygons_to_geo_multi(polygons);
+
+    // Union with itself to merge overlapping polygons and establish proper holes
+    let result = geo_multi.union(&geo_multi, 1000.0);
+    geo_multi_to_expolygons(&result)
+}
+
 /// Compute the intersection of two sets of polygons.
 pub fn intersection(subject: &[ExPolygon], clip: &[ExPolygon]) -> ExPolygons {
     if subject.is_empty() || clip.is_empty() {

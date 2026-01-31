@@ -4,18 +4,57 @@ This project is currently just an fun experiment to see how well AI can handle a
 
 This work is based on BambuStudio by BambuLab, which is based on PrusaSlicer by Prusa Research, which is from Slic3r by Alessandro Ranellucci and the RepRap community.
 
-Current validation score: **55.0/100**
+---
 
-```bash
-Rust vs C++ Comparison:
-  Files:                                    71 /      475  (14.9%)
-  Total lines:                           65689 /   243426  (26.9%)
-  Code lines (non-blank/comment):        45712 /   186433  (24.5%)
-```
+## 📊 Current Validation Status
 
-G-code line counts (3DBenchy):
-- Rust slicer: 392,617 lines
-- BambuStudio reference: 132,424 lines
+> **Last Updated:** 2025-02-01
+> 
+> **Quality Score: 53.5/100** (threshold: 70.0)
+
+### Rust vs C++ Code Coverage
+
+| Metric | Rust | C++ (libslic3r) | Coverage |
+|--------|------|-----------------|----------|
+| Files | 71 | 475 | 14.9% |
+| Total lines | 65,791 | 243,426 | 27.0% |
+| Code lines (non-blank/comment) | 45,771 | 186,433 | 24.5% |
+
+### G-code Output Comparison (3DBenchy)
+
+| Metric | BambuStudio Reference | Rust Slicer | Status |
+|--------|----------------------|-------------|--------|
+| Layers | 240 | 240 | ✅ Exact match |
+| G-code lines | 132,424 | 105,076 | 🟡 79% of reference |
+| Filament | 3,869mm | ~3,640mm | ✅ Within 6% |
+
+### Feature Move Counts
+
+| Feature | Reference | Generated | Ratio | Status |
+|---------|-----------|-----------|-------|--------|
+| Bridge Infill | 1,536 | 20 | 0.01× | 🔴 Severe under-detection |
+| External Perimeter | 28,702 | 25,655 | 0.89× | ✅ Close match |
+| Internal Perimeter | 10,318 | 27,743 | 2.7× | 🟡 Over-generation |
+| Solid Infill | 9,810 | 24,651 | 2.5× | 🟡 Over-generation |
+| Sparse Infill | 11,504 | 6,101 | 0.53× | 🟡 Under-generation |
+| Travel | 29,736 | 19,537 | 0.66× | 🟡 Different |
+| Wipe | 3,099 | 0 | 0× | 🔴 Not implemented |
+
+### Priority Issues
+
+1. **🔴 Bridge Detection** - Severe under-detection (1% of reference moves)
+2. **🟡 Internal Perimeter** - 2.7× over-generation (improved from 15×)
+3. **🟡 Solid Infill** - 2.5× over-generation (improved from under-generation)
+4. **🔴 Wipe Moves** - Not yet implemented
+5. **🟡 First Layer Height** - Z offset mismatch (0.4mm vs 0.2mm detected)
+
+### Recent Improvements
+
+- **Surface Simplification** - Added Douglas-Peucker simplification before perimeter generation (matching libslic3r behavior)
+- **G-code Size** - Reduced from 392K to 105K lines (73% reduction, now 79% of reference)
+- **External Perimeter** - Now within 11% of reference (was 7× over)
+
+---
 
 ## Current Status
 
@@ -41,6 +80,9 @@ cargo build --release
 
 # Get model info
 ./target/release/slicer-cli info model.stl
+
+# Validate against reference
+./target/release/slicer-cli validate model.stl reference.gcode --compare-only --generated output.gcode
 ```
 
 ### Library Usage
@@ -309,26 +351,6 @@ env_logger = "0.10"
 - Compare output against BambuStudio reference
 - Validates layer counts, Z heights, extrusion amounts
 
-### Current Validation Results (3DBenchy)
-
-| Metric | BambuStudio Reference | Rust Slicer | Status |
-|--------|----------------------|-------------|--------|
-| Layers | 240 | 240 | ✅ Exact match |
-| Filament | 3869mm | ~3640mm | ✅ Within 6% |
-| G-code | 132K lines | ~393K lines | 🔄 Working on parity |
-
-### Feature Comparison (Current)
-
-| Feature | Reference | Generated | Status |
-|---------|-----------|-----------|--------|
-| Bridge Infill | 1,536 moves | 16 moves | 🔴 Under-detection |
-| External Perimeter | 28,702 moves | 205,316 moves | 🔴 Over-generation |
-| Internal Perimeter | 10,318 moves | 152,428 moves | 🔴 Over-generation |
-| Solid Infill | 9,810 moves | 998 moves | 🔴 Under-generation |
-| Sparse Infill | 11,504 moves | 13,029 moves | 🟡 Close |
-| Travel | 29,736 moves | 17,939 moves | 🟡 Different |
-| Wipe | 3,099 moves | - | 🔴 Not implemented |
-
 ### G-code Comparison Strategy
 1. **Structural comparison**: Same number of layers ✅
 2. **Coordinate comparison**: Within tolerance (0.001mm) ✅
@@ -345,3 +367,31 @@ This project is licensed under AGPL-3.0, consistent with BambuStudio's license s
 - [PrusaSlicer Source](https://github.com/prusa3d/PrusaSlicer)
 - [Slic3r Manual](https://manual.slic3r.org/)
 - [Arachne Paper](https://research.tue.nl/en/publications/arachne) - Variable-width contouring
+
+---
+
+## 🤖 Agent Instructions: Updating Validation Status
+
+When you finish a session working on this project, please update the validation tables at the top of this README by running:
+
+```bash
+# From slicer/lib directory:
+
+# 1. Run validation to get current score and feature comparison
+cargo run --release -- validate ../data/test_stls/3DBenchy.stl ../data/reference_gcodes/3DBenchy.gcode \
+    --compare-only --generated ../data/output/3DBenchy_output.gcode
+
+# 2. Get line counts
+wc -l ../data/output/3DBenchy_output.gcode ../data/reference_gcodes/3DBenchy.gcode
+
+# 3. Get Rust vs C++ code coverage
+cd .. && bash scripts/line_diff.sh
+```
+
+Then update the following sections in this README:
+1. **Last Updated** date
+2. **Quality Score** 
+3. **Rust vs C++ Code Coverage** table
+4. **G-code Output Comparison** table
+5. **Feature Move Counts** table
+6. **Priority Issues** list (if priorities have changed)

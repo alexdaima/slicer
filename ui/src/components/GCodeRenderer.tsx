@@ -43,7 +43,7 @@ const GCodeTubes: React.FC<GCodeRendererProps & {
   parsedGCode,
   visibleLayerRange,
   showTravelMoves = false,
-  segmentLimit = 100000,
+  segmentLimit = 500000, // Increased for arc-interpolated segments
   showSeams = true,
   tubeResolution = 6, // Number of segments around the cylinder (6 = hexagon, 8 = octagon)
 }) => {
@@ -55,20 +55,26 @@ const GCodeTubes: React.FC<GCodeRendererProps & {
     }>();
     
     let segmentCount = 0;
-    const layerZValues = Array.from(parsedGCode.layers.keys());
     const up = new THREE.Vector3(0, 1, 0);
     const position = new THREE.Vector3();
     const scale = new THREE.Vector3();
     const quaternion = new THREEQuaternion();
     const matrix = new THREE.Matrix4();
+    
+    // Build a map of Z values to layer indices for faster lookup
+    const layerZMap = new Map<number, number>();
+    const layerZValues = Array.from(parsedGCode.layers.keys()).sort((a, b) => a - b);
+    layerZValues.forEach((z, index) => layerZMap.set(z, index));
 
     for (const segment of parsedGCode.segments) {
       if (segmentCount >= segmentLimit) break;
 
-      // Filter by layer range
+      // Filter by layer range - use the exact Z from the segment's start
       if (visibleLayerRange) {
         const [minLayer, maxLayer] = visibleLayerRange;
-        const layerIndex = layerZValues.findIndex(z => Math.abs(z - segment.start.z) < 0.001);
+        // Round Z to nearest layer Z with tolerance
+        const zRounded = Math.round(segment.start.z * 1000) / 1000;
+        const layerIndex = layerZMap.get(zRounded) ?? -1;
         if (layerIndex < minLayer || layerIndex > maxLayer) continue;
       }
 
@@ -246,7 +252,11 @@ const GCodeLineSegments: React.FC<GCodeRendererProps> = ({
     const groups = new Map<FeatureType, GCodeSegment[]>();
     
     let segmentCount = 0;
-    const layerZValues = Array.from(parsedGCode.layers.keys());
+    
+    // Build a map of Z values to layer indices for faster lookup
+    const layerZMap = new Map<number, number>();
+    const layerZValues = Array.from(parsedGCode.layers.keys()).sort((a, b) => a - b);
+    layerZValues.forEach((z, index) => layerZMap.set(z, index));
     
     for (const segment of parsedGCode.segments) {
       if (segmentCount >= segmentLimit) break;
@@ -254,7 +264,8 @@ const GCodeLineSegments: React.FC<GCodeRendererProps> = ({
       // Filter by layer range
       if (visibleLayerRange) {
         const [minLayer, maxLayer] = visibleLayerRange;
-        const layerIndex = layerZValues.findIndex(z => Math.abs(z - segment.start.z) < 0.001);
+        const zRounded = Math.round(segment.start.z * 1000) / 1000;
+        const layerIndex = layerZMap.get(zRounded) ?? -1;
         if (layerIndex < minLayer || layerIndex > maxLayer) continue;
       }
 

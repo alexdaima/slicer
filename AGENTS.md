@@ -336,6 +336,74 @@ slicer/
 
 ---
 
+## 🚨 MANDATORY: End-of-Session Validation Update
+
+**Before ending your session**, you MUST update the validation tables in `README.md` with current metrics. This ensures we track progress accurately.
+
+### Step 1: Run Validation
+
+```bash
+cd slicer/lib
+
+# Run the validation tool
+cargo run --release -- validate ../data/test_stls/3DBenchy.stl ../data/reference_gcodes/3DBenchy.gcode \
+    --compare-only --generated ../data/output/3DBenchy_output.gcode
+```
+
+Record from the output:
+- **Quality Score** (e.g., "55.0/100")
+- **Feature Move Counts** table (Bridge Infill, External Perimeter, etc.)
+
+### Step 2: Get Line Counts
+
+```bash
+# G-code line counts
+wc -l ../data/output/3DBenchy_output.gcode ../data/reference_gcodes/3DBenchy.gcode
+```
+
+### Step 3: Get Code Coverage
+
+```bash
+cd slicer
+bash scripts/line_diff.sh
+```
+
+Record:
+- Files count (Rust vs C++)
+- Total lines
+- Code lines (non-blank/comment)
+
+### Step 4: Update README.md
+
+Update these sections at the top of `slicer/README.md`:
+
+1. **Last Updated** date
+2. **Quality Score** value
+3. **Rust vs C++ Code Coverage** table
+4. **G-code Output Comparison** table (line counts)
+5. **Feature Move Counts** table
+6. **Priority Issues** list (if priorities changed based on your work)
+
+### Example README Update
+
+```markdown
+## 📊 Current Validation Status
+
+> **Last Updated:** YYYY-MM-DD
+> 
+> **Quality Score: XX.X/100** (threshold: 70.0)
+
+### Rust vs C++ Code Coverage
+
+| Metric | Rust | C++ (libslic3r) | Coverage |
+|--------|------|-----------------|----------|
+| Files | XX | 475 | XX.X% |
+| Total lines | XX,XXX | 243,426 | XX.X% |
+| Code lines (non-blank/comment) | XX,XXX | 186,433 | XX.X% |
+```
+
+---
+
 ## Contributing
 
 1. **Pick a feature** from the "Remaining" list above
@@ -344,6 +412,7 @@ slicer/
 4. **Implement with tests** and AGENTS.md documentation
 5. **Run parity tests** against reference output
 6. **Submit PR** with clear description of changes
+7. **Update README.md** with new validation metrics (see above)
 
 ---
 

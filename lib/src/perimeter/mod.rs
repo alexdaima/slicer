@@ -33,10 +33,13 @@
 pub mod arachne;
 pub mod fuzzy_skin;
 
-use crate::clipper::{difference, extract_centerlines, grow, offset2, shrink, OffsetJoinType};
+use crate::clipper::{
+    difference, extract_centerlines, grow, offset2, shrink, union_polygons_ex, OffsetJoinType,
+};
 use crate::flow::Flow;
+use crate::geometry::simplify::douglas_peucker_polygon;
 use crate::geometry::{ExPolygon, ExPolygons, Polygon, Polyline};
-use crate::CoordF;
+use crate::{scale, CoordF};
 
 /// Inset overlap tolerance for gap detection (same as BambuStudio).
 const INSET_OVERLAP_TOLERANCE: CoordF = 0.15;
@@ -82,6 +85,14 @@ pub struct PerimeterConfig {
 
     /// Join type for perimeter offset corners.
     pub join_type: OffsetJoinType,
+
+    /// Resolution for simplifying surface polygons before perimeter generation (mm).
+    /// BambuStudio default is 0.01mm. Set to 0 to disable simplification.
+    /// When arc fitting is enabled, BambuStudio uses 0.2× this value (finer resolution).
+    pub surface_simplify_resolution: CoordF,
+
+    /// Whether arc fitting will be used (affects simplification resolution).
+    pub arc_fitting_enabled: bool,
 }
 
 impl Default for PerimeterConfig {
@@ -131,7 +142,21 @@ impl PerimeterConfig {
             gap_fill_threshold: 0.0,  // Disabled by default
             thin_walls: false,        // Disabled by default
             join_type: OffsetJoinType::Miter,
+            surface_simplify_resolution: 0.01, // BambuStudio default: 0.01mm
+            arc_fitting_enabled: false,
         }
+    }
+
+    /// Set whether arc fitting is enabled (affects simplification resolution).
+    pub fn with_arc_fitting(mut self, enabled: bool) -> Self {
+        self.arc_fitting_enabled = enabled;
+        self
+    }
+
+    /// Set the surface simplification resolution (mm).
+    pub fn with_surface_resolution(mut self, resolution: CoordF) -> Self {
+        self.surface_simplify_resolution = resolution;
+        self
     }
 
     /// Create a configuration with custom spacing values.
@@ -307,6 +332,22 @@ impl PerimeterGenerator {
             return result;
         }
 
+        // BambuStudio: Simplify surface polygons before perimeter generation
+        // This reduces the number of points significantly and speeds up processing.
+        // Reference: PerimeterGenerator.cpp line 902, 933
+        // When arc fitting is enabled, use finer resolution (0.2×) since arc fitter will
+        // further reduce points during G-code generation.
+        let simplified_slices = if self.config.surface_simplify_resolution > 0.0 {
+            let resolution = if self.config.arc_fitting_enabled {
+                self.config.surface_simplify_resolution * 0.2
+            } else {
+                self.config.surface_simplify_resolution
+            };
+            self.simplify_expolygons(slices, resolution)
+        } else {
+            slices.to_vec()
+        };
+
         // Track all perimeters by level for ordering
         let mut perimeter_levels: Vec<Vec<PerimeterLoop>> =
             vec![Vec::new(); self.config.perimeter_count];
@@ -314,9 +355,9 @@ impl PerimeterGenerator {
         // Track accumulated gaps for gap fill
         let mut accumulated_gaps: ExPolygons = Vec::new();
 
-        // Current working area (starts as the full slice)
+        // Current working area (starts as the simplified slices)
         // Sort slices deterministically by bounding box for reproducible results
-        let mut current_area = slices.to_vec();
+        let mut current_area = simplified_slices;
         Self::sort_expolygons_deterministic(&mut current_area);
 
         // Whether to detect gaps (enabled when gap_fill_threshold > 0)
@@ -622,6 +663,46 @@ impl PerimeterGenerator {
     /// Calculate the inset distance for getting to the infill boundary.
     ///
     /// This is the total distance from the slice edge to the inner infill boundary.
+    /// Simplify ExPolygons using Douglas-Peucker algorithm.
+    /// This matches BambuStudio's simplify_p() behavior:
+    /// 1. Simplify contour and holes of each ExPolygon
+    /// 2. Union to clean up any self-intersections
+    fn simplify_expolygons(&self, expolygons: &[ExPolygon], resolution: CoordF) -> ExPolygons {
+        if resolution <= 0.0 {
+            return expolygons.to_vec();
+        }
+
+        // Collect all simplified polygons
+        let mut simplified_polygons: Vec<Polygon> = Vec::new();
+
+        for expoly in expolygons {
+            // Simplify contour
+            let simplified_contour = douglas_peucker_polygon(&expoly.contour, resolution);
+            if simplified_contour.len() >= 3 {
+                simplified_polygons.push(simplified_contour);
+            }
+
+            // Simplify holes
+            for hole in &expoly.holes {
+                let simplified_hole = douglas_peucker_polygon(hole, resolution);
+                if simplified_hole.len() >= 3 {
+                    // Holes need to be reversed for union_ex to work correctly
+                    let mut reversed = simplified_hole;
+                    reversed.reverse();
+                    simplified_polygons.push(reversed);
+                }
+            }
+        }
+
+        // Union to reconstruct ExPolygons and clean up any intersections
+        // This matches BambuStudio's: union_ex(surface.expolygon.simplify_p(resolution))
+        if simplified_polygons.is_empty() {
+            return Vec::new();
+        }
+
+        union_polygons_ex(&simplified_polygons)
+    }
+
     pub fn total_inset_distance(&self) -> CoordF {
         if self.config.perimeter_count == 0 {
             return 0.0;
@@ -1040,5 +1121,71 @@ mod tests {
 
         // Thin fills aren't populated yet (requires medial axis implementation)
         assert!(result.thin_fills.is_empty());
+    }
+
+    #[test]
+    fn test_surface_simplification() {
+        // Test that surface simplification reduces point count
+        // Create a polygon with many points (simulating a high-res mesh slice)
+        let mut points = Vec::new();
+        let center_x = 10.0;
+        let center_y = 10.0;
+        let radius = 5.0;
+        let num_points = 360; // Many points for a circle
+
+        for i in 0..num_points {
+            let angle = 2.0 * std::f64::consts::PI * (i as f64) / (num_points as f64);
+            let x = center_x + radius * angle.cos();
+            let y = center_y + radius * angle.sin();
+            points.push(Point::new(crate::scale(x), crate::scale(y)));
+        }
+
+        let high_res_polygon = Polygon::from_points(points);
+        let high_res_expoly: ExPolygon = high_res_polygon.into();
+
+        // Generate with simplification enabled (default)
+        let config_with_simplification = PerimeterConfig {
+            perimeter_count: 2,
+            surface_simplify_resolution: 0.01, // 10 microns - BambuStudio default
+            ..Default::default()
+        };
+        let gen_simplified = PerimeterGenerator::new(config_with_simplification);
+        let result_simplified = gen_simplified.generate(&[high_res_expoly.clone()]);
+
+        // Generate with simplification disabled
+        let config_no_simplification = PerimeterConfig {
+            perimeter_count: 2,
+            surface_simplify_resolution: 0.0, // Disabled
+            ..Default::default()
+        };
+        let gen_raw = PerimeterGenerator::new(config_no_simplification);
+        let result_raw = gen_raw.generate(&[high_res_expoly]);
+
+        // Both should produce perimeters
+        assert!(result_simplified.has_perimeters());
+        assert!(result_raw.has_perimeters());
+
+        // Count total points in perimeters
+        let simplified_points: usize = result_simplified
+            .perimeters
+            .iter()
+            .map(|p| p.polygon.len())
+            .sum();
+        let raw_points: usize = result_raw.perimeters.iter().map(|p| p.polygon.len()).sum();
+
+        // Simplified should have significantly fewer points
+        // (The 360-point circle should be simplified to ~50-100 points)
+        println!(
+            "Surface simplification: raw={} points, simplified={} points, reduction={}%",
+            raw_points,
+            simplified_points,
+            100.0 * (1.0 - simplified_points as f64 / raw_points as f64)
+        );
+
+        // Expect at least 50% reduction for a high-res circle
+        assert!(
+            simplified_points < raw_points,
+            "Simplification should reduce point count"
+        );
     }
 }

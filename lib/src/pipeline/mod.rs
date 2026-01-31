@@ -279,6 +279,11 @@ impl PipelineConfig {
         config.thin_walls = self.object.thin_walls;
         config.join_type = crate::clipper::OffsetJoinType::Miter;
 
+        // BambuStudio: surface simplification before perimeter generation
+        // Default resolution is 0.01mm. When arc fitting is enabled, use finer resolution.
+        config.surface_simplify_resolution = 0.01; // BambuStudio default
+        config.arc_fitting_enabled = self.print.arc_fitting_enabled;
+
         config
     }
 
