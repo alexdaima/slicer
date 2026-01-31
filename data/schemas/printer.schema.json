@@ -1,16 +1,10 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://helio-additive.com/slicer/schemas/printer.schema.json",
+  "$id": "slicer/schemas/printer.schema.json",
   "title": "Printer Profile",
   "description": "A 3D printer profile with nested nozzle configurations",
   "type": "object",
-  "required": [
-    "id",
-    "brand",
-    "model",
-    "build_volume",
-    "nozzle_configs"
-  ],
+  "required": ["id", "brand", "model", "build_volume", "nozzle_configs"],
   "properties": {
     "$schema": {
       "type": "string"
@@ -45,27 +39,15 @@
     },
     "technology": {
       "type": "string",
-      "enum": [
-        "FFF",
-        "FDM"
-      ]
+      "enum": ["FFF", "FDM"]
     },
     "structure": {
       "type": "string",
-      "enum": [
-        "cartesian",
-        "corexy",
-        "delta",
-        "polar"
-      ]
+      "enum": ["cartesian", "corexy", "delta", "polar"]
     },
     "build_volume": {
       "type": "object",
-      "required": [
-        "x",
-        "y",
-        "z"
-      ],
+      "required": ["x", "y", "z"],
       "properties": {
         "x": {
           "type": "number",
@@ -81,10 +63,7 @@
         },
         "origin": {
           "type": "string",
-          "enum": [
-            "center",
-            "corner"
-          ]
+          "enum": ["center", "corner"]
         }
       }
     },
@@ -125,9 +104,7 @@
   "$defs": {
     "nozzle_config": {
       "type": "object",
-      "required": [
-        "diameter"
-      ],
+      "required": ["diameter"],
       "properties": {
         "diameter": {
           "type": "number"

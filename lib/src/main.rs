@@ -118,6 +118,14 @@ enum Commands {
         #[arg(long)]
         support_buildplate_only: bool,
 
+        /// Enable arc fitting (G2/G3 commands) for smoother curves
+        #[arg(long)]
+        arc_fitting: bool,
+
+        /// Arc fitting tolerance in mm (default: 0.05)
+        #[arg(long, default_value = "0.05")]
+        arc_tolerance: f64,
+
         /// Number of threads to use (0 = auto)
         #[arg(short = 'j', long, default_value = "0")]
         threads: usize,
@@ -261,6 +269,8 @@ fn main() -> Result<()> {
             support_density,
             support_pattern,
             support_buildplate_only,
+            arc_fitting,
+            arc_tolerance,
             threads,
         } => cmd_slice(
             input,
@@ -281,6 +291,8 @@ fn main() -> Result<()> {
             support_density,
             support_pattern,
             support_buildplate_only,
+            arc_fitting,
+            arc_tolerance,
             threads,
         ),
         Commands::Validate {
@@ -366,6 +378,8 @@ fn cmd_slice(
     support_density: u32,
     support_pattern: String,
     support_buildplate_only: bool,
+    arc_fitting: bool,
+    arc_tolerance: f64,
     threads: usize,
 ) -> Result<()> {
     info!("Loading STL file: {}", input.display());
@@ -534,6 +548,14 @@ fn cmd_slice(
             .first_layer_height(first_layer_height)
             .perimeters(perimeters)
             .infill_density(infill_density as f64 / 100.0);
+
+        // Enable arc fitting if requested
+        if arc_fitting {
+            config = config
+                .arc_fitting(true)
+                .arc_fitting_tolerance(arc_tolerance);
+            info!("  Arc fitting: enabled (tolerance: {}mm)", arc_tolerance);
+        }
 
         config.object.fill_pattern = pattern;
 

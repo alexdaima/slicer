@@ -1395,7 +1395,8 @@ impl PrintPipeline {
                         }
 
                         let e_for_segment =
-                            self.calculate_e_for_distance(segment_length, width, height);
+                            self.calculate_e_for_distance(segment_length, width, height)
+                                * flow_mult;
                         current_e += e_for_segment;
 
                         writer.extrude_to(to.x, to.y, current_e, Some(feedrate));
@@ -1404,7 +1405,8 @@ impl PrintPipeline {
                 PathSegment::Arc(arc) => {
                     // Calculate extrusion for the arc
                     let arc_length = arc.arc_length();
-                    let e_for_arc = self.calculate_e_for_distance(arc_length, width, height);
+                    let e_for_arc =
+                        self.calculate_e_for_distance(arc_length, width, height) * flow_mult;
                     current_e += e_for_arc;
 
                     // Write arc move
@@ -2029,5 +2031,356 @@ mod tests {
         assert!((travel_config.max_detour_percent - 180.0).abs() < 1e-6);
         assert!(travel_config.grid_resolution > 0);
         assert!(travel_config.boundary_offset > 0);
+    }
+
+    #[test]
+    fn test_perimeter_point_density() {
+        // Diagnostic test to check if perimeters have too many points
+        use crate::mesh::load_stl;
+        use crate::perimeter::{PerimeterConfig, PerimeterGenerator};
+        use crate::slice::{Slicer, SlicingParams};
+        use std::path::PathBuf;
+
+        // Try to load the 3DBenchy STL if it exists
+        let stl_path = PathBuf::from("../data/test_stls/3DBenchy.stl");
+        if !stl_path.exists() {
+            println!("Skipping test: 3DBenchy.stl not found at {:?}", stl_path);
+            return;
+        }
+
+        let mesh = load_stl(&stl_path).expect("Failed to load 3DBenchy STL");
+
+        let slicing_params = SlicingParams {
+            layer_height: 0.2,
+            first_layer_height: 0.2,
+            ..Default::default()
+        };
+
+        let slicer = Slicer::new(slicing_params);
+        let layers = slicer.slice(&mesh).expect("Slicing failed");
+
+        let layer0 = &layers[0];
+        let slices = layer0.all_slices();
+
+        // Generate perimeters with 2 walls (like reference)
+        let perimeter_config = PerimeterConfig {
+            perimeter_count: 2,
+            perimeter_extrusion_width: 0.45,
+            external_perimeter_extrusion_width: 0.42,
+            ..Default::default()
+        };
+        let perimeter_gen = PerimeterGenerator::new(perimeter_config);
+        let perimeter_result = perimeter_gen.generate(&slices);
+
+        println!("Perimeter point density diagnostics:");
+        println!("  Total perimeters: {}", perimeter_result.perimeters.len());
+
+        let mut total_points = 0;
+        let mut total_length_mm = 0.0;
+
+        for (i, perim) in perimeter_result.perimeters.iter().enumerate() {
+            let points = perim.polygon.points().len();
+            total_points += points;
+
+            // Calculate perimeter length
+            let mut length: f64 = 0.0;
+            let pts = perim.polygon.points();
+            for j in 0..pts.len() {
+                let p1 = &pts[j];
+                let p2 = &pts[(j + 1) % pts.len()];
+                let dx = crate::unscale(p2.x - p1.x);
+                let dy = crate::unscale(p2.y - p1.y);
+                length += (dx * dx + dy * dy).sqrt();
+            }
+            total_length_mm += length;
+
+            if i < 5 {
+                // Print first 5 perimeters
+                println!(
+                    "    Perimeter {}: {} points, {:.2}mm length, {:.3}mm/point avg",
+                    i,
+                    points,
+                    length,
+                    if points > 1 {
+                        length / (points - 1) as f64
+                    } else {
+                        0.0
+                    }
+                );
+            }
+        }
+
+        println!("  Total points: {}", total_points);
+        println!("  Total length: {:.2} mm", total_length_mm);
+        println!(
+            "  Average segment length: {:.4} mm",
+            if total_points > perimeter_result.perimeters.len() {
+                total_length_mm / (total_points - perimeter_result.perimeters.len()) as f64
+            } else {
+                0.0
+            }
+        );
+
+        // BambuStudio reference has ~905 moves for ~1192mm = ~1.32mm per move
+        // If we have much shorter segments, that's the problem
+        // Ideal segment length should be around 0.5-2mm for efficiency
+
+        let avg_segment = if total_points > perimeter_result.perimeters.len() {
+            total_length_mm / (total_points - perimeter_result.perimeters.len()) as f64
+        } else {
+            0.0
+        };
+
+        println!(
+            "\n  DIAGNOSTIC: Average segment length is {:.4}mm",
+            avg_segment
+        );
+        if avg_segment < 0.1 {
+            println!(
+                "  WARNING: Segments are very short - may need Douglas-Peucker simplification"
+            );
+        }
+    }
+
+    #[test]
+    fn test_infill_area_generation_diagnostics() {
+        // Test with a simple cube to understand infill area generation
+        use crate::perimeter::{PerimeterConfig, PerimeterGenerator};
+        use crate::slice::{Slicer, SlicingParams};
+
+        let mesh = TriangleMesh::cube(20.0); // 20mm cube
+
+        let slicing_params = SlicingParams {
+            layer_height: 0.2,
+            first_layer_height: 0.2,
+            ..Default::default()
+        };
+
+        let slicer = Slicer::new(slicing_params);
+        let layers = slicer.slice(&mesh).expect("Slicing failed");
+
+        assert!(!layers.is_empty(), "Should have layers");
+
+        // Check first layer
+        let layer0 = &layers[0];
+        let slices = layer0.all_slices();
+
+        println!("Cube diagnostics:");
+        println!("  Layer 0 slice count: {}", slices.len());
+
+        // A simple cube should have exactly 1 slice (one square)
+        assert_eq!(slices.len(), 1, "Cube should have 1 slice on first layer");
+
+        // Generate perimeters with 2 walls
+        let perimeter_config = PerimeterConfig {
+            perimeter_count: 2,
+            perimeter_extrusion_width: 0.45,
+            external_perimeter_extrusion_width: 0.42,
+            ..Default::default()
+        };
+        let perimeter_gen = PerimeterGenerator::new(perimeter_config);
+        let perimeter_result = perimeter_gen.generate(&slices);
+
+        println!("  Perimeter count: {}", perimeter_result.perimeters.len());
+        println!(
+            "  Infill area count: {}",
+            perimeter_result.infill_area.len()
+        );
+
+        // Should have 2 perimeters (outer + inner) for a square
+        // Actually, should have 2 loops (outer contour at each level)
+        assert!(
+            perimeter_result.perimeters.len() >= 2,
+            "Should have at least 2 perimeter loops for 2 walls"
+        );
+
+        // Infill area should be exactly 1 region (the remaining inner area)
+        assert_eq!(
+            perimeter_result.infill_area.len(),
+            1,
+            "Cube should have exactly 1 infill region after perimeters"
+        );
+
+        // Verify infill area is smaller than original slice
+        let original_area: f64 = slices.iter().map(|s| s.area().abs()).sum();
+        let infill_area: f64 = perimeter_result
+            .infill_area
+            .iter()
+            .map(|s| s.area().abs())
+            .sum();
+
+        println!("  Original area (scaled²): {:.0}", original_area);
+        println!("  Infill area (scaled²): {:.0}", infill_area);
+
+        assert!(
+            infill_area < original_area,
+            "Infill area should be smaller than original slice"
+        );
+    }
+
+    #[test]
+    fn test_layer_paths_feature_count() {
+        // Test that a simple cube generates reasonable feature counts
+        use crate::gcode::ExtrusionRole;
+
+        let mesh = TriangleMesh::cube(20.0);
+        let config = PipelineConfig::new()
+            .layer_height(0.2)
+            .first_layer_height(0.2)
+            .perimeters(2)
+            .infill_density(0.15); // 15% infill like reference
+
+        let mut pipeline = PrintPipeline::new(config);
+        let result = pipeline.process(&mesh);
+
+        assert!(result.is_ok(), "Pipeline should succeed");
+        let gcode = result.unwrap();
+
+        // Count features in the G-code
+        let content = gcode.content();
+        let outer_wall_count = content.matches("; FEATURE: Outer wall").count();
+        let inner_wall_count = content.matches("; FEATURE: Inner wall").count();
+        let solid_infill_count = content.matches("; FEATURE: Internal solid infill").count();
+        let sparse_infill_count = content.matches("; FEATURE: Sparse infill").count();
+
+        println!("Feature counts for 20mm cube:");
+        println!("  Outer wall features: {}", outer_wall_count);
+        println!("  Inner wall features: {}", inner_wall_count);
+        println!("  Solid infill features: {}", solid_infill_count);
+        println!("  Sparse infill features: {}", sparse_infill_count);
+
+        // For a cube with 2 perimeters:
+        // - Each layer should have 1 outer wall feature and 1 inner wall feature
+        // - Bottom layers should have solid infill
+        // - Middle layers should have sparse infill
+        // - Top layers should have solid infill
+
+        // With layer_height=0.2 and 20mm height, we have 100 layers
+        // With 3 bottom + 4 top solid layers = 7 solid layers, 93 sparse layers
+
+        // Outer wall: should be roughly equal to layer count (1 per layer for simple cube)
+        assert!(
+            outer_wall_count >= 90 && outer_wall_count <= 110,
+            "Outer wall count {} should be close to layer count",
+            outer_wall_count
+        );
+
+        // Inner wall: should be roughly equal to layer count
+        assert!(
+            inner_wall_count >= 90 && inner_wall_count <= 110,
+            "Inner wall count {} should be close to layer count",
+            inner_wall_count
+        );
+
+        // Solid infill should be relatively low (only top/bottom layers)
+        assert!(
+            solid_infill_count <= 20,
+            "Solid infill count {} should be low (only top/bottom)",
+            solid_infill_count
+        );
+    }
+
+    #[test]
+    fn test_benchy_first_layer_slices() {
+        // Test to understand why 3DBenchy generates more infill regions than expected
+        use crate::mesh::load_stl;
+        use crate::perimeter::{PerimeterConfig, PerimeterGenerator};
+        use crate::slice::{Slicer, SlicingParams};
+        use std::path::PathBuf;
+
+        // Try to load the 3DBenchy STL if it exists
+        let stl_path = PathBuf::from("../data/test_stls/3DBenchy.stl");
+        if !stl_path.exists() {
+            println!("Skipping test: 3DBenchy.stl not found at {:?}", stl_path);
+            return;
+        }
+
+        let mesh = load_stl(&stl_path).expect("Failed to load 3DBenchy STL");
+
+        let slicing_params = SlicingParams {
+            layer_height: 0.2,
+            first_layer_height: 0.2,
+            ..Default::default()
+        };
+
+        let slicer = Slicer::new(slicing_params);
+        let layers = slicer.slice(&mesh).expect("Slicing failed");
+
+        println!("3DBenchy diagnostics:");
+        println!("  Total layers: {}", layers.len());
+
+        // Check first layer
+        let layer0 = &layers[0];
+        let slices = layer0.all_slices();
+
+        println!("  Layer 0 slice count: {}", slices.len());
+
+        // Print info about each slice
+        for (i, slice) in slices.iter().enumerate() {
+            let area_mm2 = slice.area().abs() / (crate::SCALING_FACTOR * crate::SCALING_FACTOR);
+            println!(
+                "    Slice {}: area = {:.2} mm², holes = {}",
+                i,
+                area_mm2,
+                slice.holes.len()
+            );
+        }
+
+        // Generate perimeters with 2 walls (like reference)
+        let perimeter_config = PerimeterConfig {
+            perimeter_count: 2,
+            perimeter_extrusion_width: 0.45,
+            external_perimeter_extrusion_width: 0.42,
+            ..Default::default()
+        };
+        let perimeter_gen = PerimeterGenerator::new(perimeter_config);
+        let perimeter_result = perimeter_gen.generate(&slices);
+
+        println!("\n  Perimeter generation:");
+        println!(
+            "    Total perimeters: {}",
+            perimeter_result.perimeters.len()
+        );
+
+        // Count external vs internal perimeters
+        let external_count = perimeter_result
+            .perimeters
+            .iter()
+            .filter(|p| p.is_external)
+            .count();
+        let internal_count = perimeter_result.perimeters.len() - external_count;
+        println!("    External (outer) perimeters: {}", external_count);
+        println!("    Internal (inner) perimeters: {}", internal_count);
+
+        println!(
+            "    Infill area count: {}",
+            perimeter_result.infill_area.len()
+        );
+
+        // Print info about each infill region
+        for (i, infill_region) in perimeter_result.infill_area.iter().enumerate() {
+            let area_mm2 =
+                infill_region.area().abs() / (crate::SCALING_FACTOR * crate::SCALING_FACTOR);
+            println!(
+                "    Infill region {}: area = {:.2} mm², holes = {}",
+                i,
+                area_mm2,
+                infill_region.holes.len()
+            );
+        }
+
+        // The issue: if we have many small infill regions, we generate many FEATURE comments
+        // Expected: 3DBenchy should have a few main regions (hull, deck, etc.)
+        // If infill_area.len() is much larger than expected, that's the problem
+
+        // For a typical 3DBenchy first layer, we expect:
+        // - Main hull contour (large area)
+        // - Some internal features
+        // Total should be a small number, not 10+
+        println!(
+            "\n  DIAGNOSTIC: {} infill regions may cause {} FEATURE comments",
+            perimeter_result.infill_area.len(),
+            perimeter_result.infill_area.len()
+        );
     }
 }

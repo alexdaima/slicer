@@ -1266,7 +1266,7 @@ def update_schemas(output_dir: Path):
     # Printer schema
     printer_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "https://helio-additive.com/slicer/schemas/printer.schema.json",
+        "$id": "slicer/schemas/printer.schema.json",
         "title": "Printer Profile",
         "description": "A 3D printer profile with nested nozzle configurations",
         "type": "object",
@@ -1335,7 +1335,7 @@ def update_schemas(output_dir: Path):
     # Filament schema
     filament_schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "https://helio-additive.com/slicer/schemas/filament.schema.json",
+        "$id": "slicer/schemas/filament.schema.json",
         "title": "Filament Profile",
         "description": "A filament material profile",
         "type": "object",

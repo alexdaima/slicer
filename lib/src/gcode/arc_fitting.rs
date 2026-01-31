@@ -367,8 +367,17 @@ impl ArcFitter {
         // Find circle center through these three points
         let center = self.find_circle_center(p1, p2, p3)?;
 
-        // Calculate radius
+        // Calculate radius from start point
         let radius = ((p1.x - center.x).powi(2) + (p1.y - center.y).powi(2)).sqrt();
+
+        // Verify end point is also on the circle (within tolerance)
+        // This is critical for valid G2/G3 arcs - both endpoints must be at the same radius
+        let end_radius = ((p3.x - center.x).powi(2) + (p3.y - center.y).powi(2)).sqrt();
+        let radius_deviation = (radius - end_radius).abs();
+        if radius_deviation > self.config.tolerance {
+            // End point is not on the circle - arc would be malformed
+            return None;
+        }
 
         // Check radius bounds
         if radius < self.config.min_radius || radius > self.config.max_radius {

@@ -744,6 +744,43 @@ impl PathGenerator {
             paths.push(path);
         }
 
+        // Convert gap fills to extrusion paths
+        // Gap fills use a smaller width and are printed at perimeter speed
+        for gap_fill in &perimeters.gap_fills {
+            if gap_fill.len() < 2 {
+                continue;
+            }
+
+            // Gap fills typically use a reduced width (approximately 0.5-0.8x perimeter width)
+            // The actual width should ideally come from the gap detection, but for now
+            // we use a reasonable default
+            let gap_width = self.config.perimeter_width * 0.7;
+
+            let path = ExtrusionPath::from_polyline(gap_fill, ExtrusionRole::GapFill)
+                .with_width(gap_width)
+                .with_height(layer_height)
+                .with_speed(self.config.perimeter_speed);
+
+            paths.push(path);
+        }
+
+        // Convert thin fills to extrusion paths (similar to gap fills)
+        for thin_fill in &perimeters.thin_fills {
+            if thin_fill.len() < 2 {
+                continue;
+            }
+
+            // Thin fills also use reduced width
+            let thin_width = self.config.perimeter_width * 0.5;
+
+            let path = ExtrusionPath::from_polyline(thin_fill, ExtrusionRole::GapFill)
+                .with_width(thin_width)
+                .with_height(layer_height)
+                .with_speed(self.config.perimeter_speed);
+
+            paths.push(path);
+        }
+
         paths
     }
 
@@ -980,11 +1017,132 @@ impl PathGenerator {
 
     /// Optimize path order using nearest-neighbor heuristic.
     ///
+    /// IMPORTANT: This optimization preserves feature type grouping to avoid
+    /// interleaving different feature types (e.g., perimeters and infill).
+    /// This reduces the number of FEATURE comments in the output and produces
+    /// more logical print order.
+    ///
     /// Uses deterministic tie-breaking when paths have equal distances to ensure
     /// reproducible results across runs. Tie-breaking is based on:
     /// 1. Original path index (lower index wins)
     /// 2. Path start point coordinates (lower X, then lower Y wins)
     fn optimize_path_order(&mut self, paths: &mut Vec<ExtrusionPath>) {
+        if paths.len() < 2 {
+            return;
+        }
+
+        // Group paths by their role (feature type) to avoid interleaving
+        // This preserves the logical grouping: all perimeters together, then infill, etc.
+        let mut groups: Vec<(ExtrusionRole, Vec<usize>)> = Vec::new();
+
+        for (idx, path) in paths.iter().enumerate() {
+            // Check if we already have a group for this role
+            if let Some(group) = groups.iter_mut().find(|(role, _)| *role == path.role) {
+                group.1.push(idx);
+            } else {
+                groups.push((path.role, vec![idx]));
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(paths.len());
+
+        // Start from current position or first path
+        let start_pos = self
+            .current_position
+            .unwrap_or_else(|| paths[0].first_point().unwrap_or(Point::new(0, 0)));
+
+        let mut current_pos = start_pos;
+
+        // Process each feature group in order, optimizing within the group
+        for (_role, group_indices) in groups {
+            if group_indices.is_empty() {
+                continue;
+            }
+
+            let mut remaining = group_indices;
+
+            while !remaining.is_empty() {
+                // Find nearest path within this group with deterministic tie-breaking
+                let mut best_idx = 0;
+                let mut best_dist = i64::MAX;
+                let mut best_original_idx = usize::MAX;
+                let mut best_start_point = Point::new(i64::MAX, i64::MAX);
+                let mut reverse_best = false;
+
+                for (i, &path_idx) in remaining.iter().enumerate() {
+                    let path = &paths[path_idx];
+
+                    if let Some(start) = path.first_point() {
+                        let dist = distance_squared(current_pos, start);
+                        // Use deterministic tie-breaking: prefer lower distance, then lower
+                        // original index, then lower start point (X then Y)
+                        let is_better = dist < best_dist
+                            || (dist == best_dist
+                                && (path_idx < best_original_idx
+                                    || (path_idx == best_original_idx
+                                        && Self::point_less_than(start, best_start_point))));
+
+                        if is_better {
+                            best_dist = dist;
+                            best_idx = i;
+                            best_original_idx = path_idx;
+                            best_start_point = start;
+                            reverse_best = false;
+                        }
+                    }
+
+                    // For open paths, also consider starting from the end
+                    if !path.is_closed {
+                        if let Some(end) = path.last_point() {
+                            let dist = distance_squared(current_pos, end);
+                            let is_better = dist < best_dist
+                                || (dist == best_dist
+                                    && (path_idx < best_original_idx
+                                        || (path_idx == best_original_idx
+                                            && Self::point_less_than(end, best_start_point))));
+
+                            if is_better {
+                                best_dist = dist;
+                                best_idx = i;
+                                best_original_idx = path_idx;
+                                best_start_point = end;
+                                reverse_best = true;
+                            }
+                        }
+                    }
+                }
+
+                // Add the best path from this group
+                let path_idx = remaining.remove(best_idx);
+                let mut path = paths[path_idx].clone();
+
+                if reverse_best {
+                    path.reverse();
+                }
+
+                // Update current position
+                if let Some(end) = path.last_point() {
+                    current_pos = end;
+                }
+
+                ordered.push(path);
+            }
+        }
+
+        *paths = ordered;
+
+        // Update current position for next layer
+        if let Some(last_path) = paths.last() {
+            if let Some(end) = last_path.last_point() {
+                self.current_position = Some(end);
+            }
+        }
+    }
+
+    /// Legacy path optimization that doesn't preserve feature grouping.
+    /// Kept for reference but not used.
+    #[allow(dead_code)]
+    fn optimize_path_order_legacy(&mut self, paths: &mut Vec<ExtrusionPath>) {
         if paths.len() < 2 {
             return;
         }

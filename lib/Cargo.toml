@@ -2,10 +2,10 @@
 name = "slicer"
 version = "0.1.0"
 edition = "2021"
-authors = ["Helio Additive"]
+authors = ["alexdaima"]
 description = "A Rust rewrite of the BambuStudio core slicing algorithm"
 license = "AGPL-3.0"
-repository = "https://github.com/Helio-Additive/slicer"
+repository = "https://github.com/alexdaima/slicer"
 keywords = ["3d-printing", "slicer", "gcode", "stl"]
 categories = ["graphics", "rendering"]
 

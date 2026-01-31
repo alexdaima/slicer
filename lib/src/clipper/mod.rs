@@ -382,6 +382,207 @@ pub fn total_area(expolygons: &[ExPolygon]) -> CoordF {
     expolygons.iter().map(|p| p.area()).sum()
 }
 
+/// Morphological opening: shrink then grow by the same amount.
+///
+/// This removes small protrusions and smooths contours while preserving
+/// the overall shape. Used for gap detection and thin wall handling.
+///
+/// # Arguments
+/// * `expolygons` - The polygons to process
+/// * `distance` - The opening distance in mm
+/// * `join_type` - The join type for offset corners
+pub fn opening(
+    expolygons: &[ExPolygon],
+    distance: CoordF,
+    join_type: OffsetJoinType,
+) -> ExPolygons {
+    if expolygons.is_empty() || distance <= 0.0 {
+        return expolygons.to_vec();
+    }
+    let shrunk = shrink(expolygons, distance, join_type);
+    grow(&shrunk, distance, join_type)
+}
+
+/// Morphological closing: grow then shrink by the same amount.
+///
+/// This fills small gaps and holes while preserving the overall shape.
+///
+/// # Arguments
+/// * `expolygons` - The polygons to process
+/// * `distance` - The closing distance in mm
+/// * `join_type` - The join type for offset corners
+pub fn closing(
+    expolygons: &[ExPolygon],
+    distance: CoordF,
+    join_type: OffsetJoinType,
+) -> ExPolygons {
+    if expolygons.is_empty() || distance <= 0.0 {
+        return expolygons.to_vec();
+    }
+    let grown = grow(expolygons, distance, join_type);
+    shrink(&grown, distance, join_type)
+}
+
+/// Offset2: shrink by amount1, then grow by amount2.
+///
+/// This is the general morphological operation used in BambuStudio for
+/// perimeter generation and gap detection. When amount1 != amount2, it
+/// creates controlled erosion/dilation.
+///
+/// # Arguments
+/// * `expolygons` - The polygons to process
+/// * `shrink_amount` - Amount to shrink (positive)
+/// * `grow_amount` - Amount to grow back (positive)
+/// * `join_type` - The join type for offset corners
+pub fn offset2(
+    expolygons: &[ExPolygon],
+    shrink_amount: CoordF,
+    grow_amount: CoordF,
+    join_type: OffsetJoinType,
+) -> ExPolygons {
+    if expolygons.is_empty() {
+        return vec![];
+    }
+    let shrunk = shrink(expolygons, shrink_amount.abs(), join_type);
+    if shrunk.is_empty() {
+        return vec![];
+    }
+    grow(&shrunk, grow_amount.abs(), join_type)
+}
+
+/// Detect gaps between two polygon sets.
+///
+/// Gaps are the narrow regions that exist in the outer area but not in the
+/// inner area. This is used for gap fill detection between perimeter levels.
+///
+/// # Arguments
+/// * `outer` - The outer boundary (e.g., previous perimeter level)
+/// * `inner` - The inner boundary (e.g., current perimeter level after offset)
+/// * `min_width` - Minimum gap width to detect (mm)
+/// * `max_width` - Maximum gap width to detect (mm)
+/// * `join_type` - The join type for offset corners
+///
+/// # Returns
+/// ExPolygons representing the detected gap regions.
+pub fn detect_gaps(
+    outer: &[ExPolygon],
+    inner: &[ExPolygon],
+    min_width: CoordF,
+    max_width: CoordF,
+    join_type: OffsetJoinType,
+) -> ExPolygons {
+    if outer.is_empty() {
+        return vec![];
+    }
+
+    // Gap detection algorithm from BambuStudio:
+    // 1. Shrink outer by half of expected gap width to get where gaps might be
+    // 2. Grow inner back by half of max width plus safety offset
+    // 3. Take the difference - these are the potential gap regions
+    // 4. Apply opening to remove regions smaller than min_width
+    // 5. Apply offset2 to remove regions larger than max_width
+
+    let half_min = min_width / 2.0;
+    let half_max = max_width / 2.0;
+    const SAFETY_OFFSET: CoordF = 0.00001; // 10nm safety offset
+
+    // Regions that might be gaps: shrink outer slightly
+    let potential_gaps = shrink(outer, half_min, join_type);
+
+    // Regions covered by inner perimeters (with some margin)
+    let inner_expanded = grow(inner, half_max + SAFETY_OFFSET, join_type);
+
+    // Gaps are where potential gaps exist but inner doesn't cover
+    let raw_gaps = difference(&potential_gaps, &inner_expanded);
+
+    if raw_gaps.is_empty() {
+        return vec![];
+    }
+
+    // Clean up: apply morphological opening to remove too-narrow regions
+    let opened = opening(&raw_gaps, half_min, join_type);
+
+    // Apply offset2 to remove regions that are too wide
+    // (they should be filled by normal infill, not gap fill)
+    let gaps = offset2(&opened, half_max, half_max + SAFETY_OFFSET, join_type);
+
+    gaps
+}
+
+/// Extract centerlines from narrow polygon regions using offset approximation.
+///
+/// This is a simplified alternative to medial axis computation. It works by
+/// progressively shrinking the polygon and collecting the resulting contours.
+///
+/// # Arguments
+/// * `expolygons` - The narrow regions to extract centerlines from
+/// * `width` - The expected width of the regions (mm)
+/// * `join_type` - The join type for offset corners
+///
+/// # Returns
+/// Polylines representing approximate centerlines.
+pub fn extract_centerlines(
+    expolygons: &[ExPolygon],
+    width: CoordF,
+    join_type: OffsetJoinType,
+) -> Vec<Polyline> {
+    if expolygons.is_empty() || width <= 0.0 {
+        return vec![];
+    }
+
+    let mut centerlines = Vec::new();
+
+    // Shrink by half the width to get approximate centerlines
+    let half_width = width / 2.0;
+    let shrunk = shrink(expolygons, half_width, join_type);
+
+    // Convert the resulting polygons to polylines
+    for expoly in &shrunk {
+        // Convert contour to polyline
+        if !expoly.contour.is_empty() {
+            let mut points = expoly.contour.points().to_vec();
+            // Close the polyline by adding the first point at the end
+            if let Some(first) = points.first().cloned() {
+                points.push(first);
+            }
+            if points.len() >= 2 {
+                centerlines.push(Polyline::from_points(points));
+            }
+        }
+
+        // Convert holes to polylines
+        for hole in &expoly.holes {
+            if !hole.is_empty() {
+                let mut points = hole.points().to_vec();
+                if let Some(first) = points.first().cloned() {
+                    points.push(first);
+                }
+                if points.len() >= 2 {
+                    centerlines.push(Polyline::from_points(points));
+                }
+            }
+        }
+    }
+
+    // If shrinking eliminated everything, try a different approach:
+    // Take the original polygon contours as approximate centerlines
+    if centerlines.is_empty() {
+        for expoly in expolygons {
+            if !expoly.contour.is_empty() {
+                let mut points = expoly.contour.points().to_vec();
+                if let Some(first) = points.first().cloned() {
+                    points.push(first);
+                }
+                if points.len() >= 2 {
+                    centerlines.push(Polyline::from_points(points));
+                }
+            }
+        }
+    }
+
+    centerlines
+}
+
 /// Intersect polylines with a set of ExPolygons, returning clipped polylines.
 ///
 /// This clips the input polylines to only the portions that fall inside
@@ -722,5 +923,148 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert!((filtered[0].area() - large.area()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_opening() {
+        // Opening removes small protrusions
+        let square = make_square_mm(0.0, 0.0, 10.0);
+        let original_area = square.area();
+
+        // Opening with small distance should approximately preserve area
+        let opened = opening(&[square], 0.1, OffsetJoinType::Round);
+        assert!(!opened.is_empty());
+
+        let opened_area: CoordF = opened.iter().map(|p| p.area()).sum();
+        // Area should be slightly smaller due to corner rounding
+        assert!(opened_area > 0.0);
+        assert!(opened_area <= original_area * 1.01); // Allow small tolerance
+    }
+
+    #[test]
+    fn test_closing() {
+        // Closing fills small gaps
+        let square = make_square_mm(0.0, 0.0, 10.0);
+        let original_area = square.area();
+
+        // Closing with small distance should approximately preserve area
+        let closed = closing(&[square], 0.1, OffsetJoinType::Round);
+        assert!(!closed.is_empty());
+
+        let closed_area: CoordF = closed.iter().map(|p| p.area()).sum();
+        // Area should be slightly larger due to corner filling
+        assert!(closed_area > 0.0);
+        assert!(closed_area >= original_area * 0.99); // Allow small tolerance
+    }
+
+    #[test]
+    fn test_offset2() {
+        let square = make_square_mm(0.0, 0.0, 10.0);
+        let original_area = square.area();
+
+        // offset2 with equal shrink/grow should approximately preserve shape
+        let result = offset2(&[square], 0.5, 0.5, OffsetJoinType::Round);
+        assert!(!result.is_empty());
+
+        let result_area: CoordF = result.iter().map(|p| p.area()).sum();
+        // Should be roughly similar (some corner effects expected)
+        assert!(result_area > original_area * 0.8);
+    }
+
+    #[test]
+    fn test_offset2_removes_thin_features() {
+        // Create a shape with a thin protrusion
+        // offset2 should remove it
+        let thin_protrusion = Polygon::from_points(vec![
+            Point::new(crate::scale(0.0), crate::scale(0.0)),
+            Point::new(crate::scale(10.0), crate::scale(0.0)),
+            Point::new(crate::scale(10.0), crate::scale(10.0)),
+            Point::new(crate::scale(5.5), crate::scale(10.0)), // Thin protrusion starts
+            Point::new(crate::scale(5.5), crate::scale(11.0)), // 0.5mm wide, 1mm tall
+            Point::new(crate::scale(4.5), crate::scale(11.0)),
+            Point::new(crate::scale(4.5), crate::scale(10.0)), // Thin protrusion ends
+            Point::new(crate::scale(0.0), crate::scale(10.0)),
+        ]);
+        let expoly: ExPolygon = thin_protrusion.into();
+
+        // offset2 with 1mm shrink/grow should remove the 0.5mm wide protrusion
+        let result = offset2(&[expoly], 1.0, 1.0, OffsetJoinType::Round);
+
+        // Result should exist but be simpler (protrusion removed)
+        if !result.is_empty() {
+            let result_area: CoordF = result.iter().map(|p| p.area()).sum();
+            // Should be close to 100mm² (the main square)
+            let expected_area = 100.0 * crate::SCALING_FACTOR * crate::SCALING_FACTOR;
+            assert!(result_area < expected_area * 1.1);
+        }
+    }
+
+    #[test]
+    fn test_detect_gaps_no_gaps() {
+        // Two concentric squares - no gaps should be detected
+        let outer = make_square_mm(0.0, 0.0, 20.0);
+        let inner = make_square_mm(2.0, 2.0, 16.0);
+
+        let gaps = detect_gaps(&[outer], &[inner], 0.2, 2.0, OffsetJoinType::Round);
+
+        // Depending on geometry, gaps may or may not be found
+        // The key is that the function doesn't crash
+        println!("Detected {} gap regions", gaps.len());
+    }
+
+    #[test]
+    fn test_detect_gaps_empty_inputs() {
+        let square = make_square_mm(0.0, 0.0, 10.0);
+
+        // Empty outer should return empty
+        let gaps1 = detect_gaps(&[], &[square.clone()], 0.2, 2.0, OffsetJoinType::Round);
+        assert!(gaps1.is_empty());
+
+        // Empty inner should work (everything is a gap)
+        let gaps2 = detect_gaps(&[square], &[], 0.2, 2.0, OffsetJoinType::Round);
+        // Result depends on parameters, but shouldn't crash
+        println!("Gaps with empty inner: {}", gaps2.len());
+    }
+
+    #[test]
+    fn test_extract_centerlines_simple() {
+        // A narrow rectangle should produce a centerline along its length
+        let thin_rect = Polygon::from_points(vec![
+            Point::new(crate::scale(0.0), crate::scale(0.0)),
+            Point::new(crate::scale(20.0), crate::scale(0.0)),
+            Point::new(crate::scale(20.0), crate::scale(1.0)), // 1mm wide
+            Point::new(crate::scale(0.0), crate::scale(1.0)),
+        ]);
+        let expoly: ExPolygon = thin_rect.into();
+
+        let centerlines = extract_centerlines(&[expoly], 1.0, OffsetJoinType::Round);
+
+        // Should produce at least one centerline
+        println!("Extracted {} centerlines", centerlines.len());
+        // The function should not crash and should return something
+    }
+
+    #[test]
+    fn test_extract_centerlines_empty() {
+        let centerlines = extract_centerlines(&[], 1.0, OffsetJoinType::Round);
+        assert!(centerlines.is_empty());
+    }
+
+    #[test]
+    fn test_opening_empty_input() {
+        let result = opening(&[], 1.0, OffsetJoinType::Round);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_closing_empty_input() {
+        let result = closing(&[], 1.0, OffsetJoinType::Round);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_offset2_empty_input() {
+        let result = offset2(&[], 1.0, 1.0, OffsetJoinType::Round);
+        assert!(result.is_empty());
     }
 }

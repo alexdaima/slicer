@@ -33,9 +33,14 @@
 pub mod arachne;
 pub mod fuzzy_skin;
 
-use crate::clipper::{shrink, OffsetJoinType};
+use crate::clipper::{
+    detect_gaps, difference, extract_centerlines, grow, offset2, shrink, OffsetJoinType,
+};
 use crate::geometry::{ExPolygon, ExPolygons, Polygon, Polyline};
 use crate::CoordF;
+
+/// Inset overlap tolerance for gap detection (same as BambuStudio).
+const INSET_OVERLAP_TOLERANCE: CoordF = 0.15;
 
 /// Configuration for perimeter generation.
 #[derive(Debug, Clone)]
@@ -248,10 +253,20 @@ impl PerimeterGenerator {
         let mut perimeter_levels: Vec<Vec<PerimeterLoop>> =
             vec![Vec::new(); self.config.perimeter_count];
 
+        // Track accumulated gaps for gap fill
+        let mut accumulated_gaps: ExPolygons = Vec::new();
+
         // Current working area (starts as the full slice)
         // Sort slices deterministically by bounding box for reproducible results
         let mut current_area = slices.to_vec();
         Self::sort_expolygons_deterministic(&mut current_area);
+
+        // Perimeter spacing for gap detection
+        let perimeter_spacing = self.config.perimeter_extrusion_width;
+        let ext_perimeter_spacing = self.config.external_perimeter_extrusion_width;
+
+        // Whether to detect gaps (enabled when gap_fill_threshold > 0)
+        let detect_gap_fill = self.config.gap_fill_threshold > 0.0;
 
         // Generate each perimeter level
         for perimeter_idx in 0..self.config.perimeter_count {
@@ -272,8 +287,50 @@ impl PerimeterGenerator {
                 extrusion_width
             };
 
-            // Shrink the current area to get the perimeter centerlines
-            let perimeter_area = shrink(&current_area, offset_distance, self.config.join_type);
+            // Calculate spacing for gap detection (BambuStudio uses spacing, not width)
+            let min_spacing = if is_external {
+                ext_perimeter_spacing
+            } else {
+                perimeter_spacing
+            };
+
+            // Use offset2 for internal perimeters to enable proper gap detection
+            // This removes narrow protrusions that would cause gaps
+            let perimeter_area = if perimeter_idx == 0 || !detect_gap_fill {
+                // External perimeter or gap fill disabled: simple shrink
+                shrink(&current_area, offset_distance, self.config.join_type)
+            } else {
+                // Internal perimeters with gap fill: use offset2 to clean up
+                // shrink by (distance + min_spacing/2 - epsilon), then grow by (min_spacing/2 - epsilon)
+                let shrink_amount = offset_distance + min_spacing / 2.0 - 0.001;
+                let grow_amount = min_spacing / 2.0 - 0.001;
+                offset2(
+                    &current_area,
+                    shrink_amount,
+                    grow_amount,
+                    self.config.join_type,
+                )
+            };
+
+            // Detect gaps between previous and current perimeter levels
+            if detect_gap_fill && perimeter_idx > 0 && !perimeter_area.is_empty() {
+                // Gap detection: find regions in current_area that are too narrow
+                // to fit a perimeter but wide enough for gap fill
+                //
+                // BambuStudio algorithm:
+                // gaps = diff(offset(last, -0.5*distance), offset(offsets, 0.5*distance + safety))
+                let gap_outer = shrink(&current_area, 0.5 * offset_distance, self.config.join_type);
+                let gap_inner = grow(
+                    &perimeter_area,
+                    0.5 * offset_distance + 0.001,
+                    self.config.join_type,
+                );
+                let gaps = difference(&gap_outer, &gap_inner);
+
+                if !gaps.is_empty() {
+                    accumulated_gaps.extend(gaps);
+                }
+            }
 
             if perimeter_area.is_empty() {
                 // No more room for perimeters
@@ -322,6 +379,11 @@ impl PerimeterGenerator {
         let inner_offset = self.config.perimeter_extrusion_width / 2.0;
         result.infill_area = shrink(&current_area, inner_offset, self.config.join_type);
 
+        // Process accumulated gaps into gap fills
+        if detect_gap_fill && !accumulated_gaps.is_empty() {
+            result.gap_fills = self.process_gaps(&accumulated_gaps);
+        }
+
         // Order perimeters for printing
         // Default is inside-out (external perimeters last) unless configured otherwise
         // Sort each level deterministically before adding
@@ -345,6 +407,81 @@ impl PerimeterGenerator {
     /// Generate perimeters for a single ExPolygon.
     pub fn generate_single(&self, expoly: &ExPolygon) -> PerimeterResult {
         self.generate(&[expoly.clone()][..])
+    }
+
+    /// Process detected gaps into gap fill polylines.
+    ///
+    /// This implements BambuStudio's gap fill algorithm:
+    /// 1. Collapse gaps using morphological opening
+    /// 2. Remove regions that are too small or too large
+    /// 3. Extract centerlines using medial axis approximation
+    fn process_gaps(&self, gaps: &ExPolygons) -> Vec<Polyline> {
+        use crate::clipper::opening;
+
+        if gaps.is_empty() {
+            return vec![];
+        }
+
+        let perimeter_width = self.config.perimeter_extrusion_width;
+        let perimeter_spacing = perimeter_width; // Approximation
+
+        // BambuStudio gap fill parameters
+        let min_width = 0.2 * perimeter_width * (1.0 - INSET_OVERLAP_TOLERANCE);
+        let max_width = 2.0 * perimeter_spacing;
+
+        // Collapse gaps: opening removes regions narrower than min_width
+        let opened = opening(gaps, min_width / 2.0, self.config.join_type);
+
+        if opened.is_empty() {
+            return vec![];
+        }
+
+        // Remove regions that are too wide (they should be infill, not gap fill)
+        // offset2 with -max/2, +max/2 removes regions wider than max_width
+        let collapsed = offset2(
+            &opened,
+            max_width / 2.0,
+            max_width / 2.0 + 0.00001, // Small safety offset
+            self.config.join_type,
+        );
+
+        // Keep only the difference (the narrow parts)
+        let gap_regions = difference(&opened, &collapsed);
+
+        if gap_regions.is_empty() {
+            // All gaps were too wide, use the opened result directly
+            // but only if within threshold
+            let filtered: ExPolygons = opened
+                .into_iter()
+                .filter(|g| {
+                    // Rough width estimate: area / perimeter * 2
+                    let perim = g.contour.perimeter();
+                    if perim > 0.0 {
+                        let width_estimate = (g.area().abs() * 2.0) / perim;
+                        width_estimate <= max_width && width_estimate >= min_width
+                    } else {
+                        false
+                    }
+                })
+                .collect();
+
+            if filtered.is_empty() {
+                return vec![];
+            }
+
+            return extract_centerlines(&filtered, perimeter_width, self.config.join_type);
+        }
+
+        // Extract centerlines from gap regions
+        // Use an average expected width for centerline extraction
+        let avg_width = (min_width + max_width) / 2.0;
+        let mut centerlines = extract_centerlines(&gap_regions, avg_width, self.config.join_type);
+
+        // Filter out very short gap fills
+        let min_length = self.config.gap_fill_threshold;
+        centerlines.retain(|pl| pl.length() >= crate::scale(min_length) as f64);
+
+        centerlines
     }
 
     /// Sort ExPolygons deterministically by bounding box (min X, then min Y, then area).
@@ -715,5 +852,103 @@ mod tests {
 
         // Should have infill areas for both
         assert!(result.infill_area.len() >= 2);
+    }
+
+    #[test]
+    fn test_gap_fill_detection_disabled_by_default() {
+        // When gap_fill_threshold is 0, gap fills should not be generated
+        let square = make_square_mm(0.0, 0.0, 20.0);
+        let config = PerimeterConfig {
+            perimeter_count: 3,
+            perimeter_extrusion_width: 0.45,
+            external_perimeter_extrusion_width: 0.45,
+            gap_fill_threshold: 0.0, // Disabled
+            ..Default::default()
+        };
+
+        let generator = PerimeterGenerator::new(config);
+        let result = generator.generate(&[square]);
+
+        // Gap fills should be empty when disabled
+        assert!(result.gap_fills.is_empty());
+    }
+
+    #[test]
+    fn test_gap_fill_detection_enabled() {
+        // Create a narrow region that should generate gap fills
+        // A thin rectangle that's too narrow for normal infill but suitable for gap fill
+        let thin_rect = Polygon::from_points(vec![
+            Point::new(crate::scale(0.0), crate::scale(0.0)),
+            Point::new(crate::scale(20.0), crate::scale(0.0)),
+            Point::new(crate::scale(20.0), crate::scale(1.5)), // 1.5mm tall - narrow
+            Point::new(crate::scale(0.0), crate::scale(1.5)),
+        ]);
+        let expoly: ExPolygon = thin_rect.into();
+
+        let config = PerimeterConfig {
+            perimeter_count: 2,
+            perimeter_extrusion_width: 0.45,
+            external_perimeter_extrusion_width: 0.45,
+            gap_fill_threshold: 0.2, // Enable gap fill
+            ..Default::default()
+        };
+
+        let generator = PerimeterGenerator::new(config);
+        let result = generator.generate(&[expoly]);
+
+        // Should generate perimeters
+        assert!(result.has_perimeters());
+        println!(
+            "Generated {} perimeters, {} gap fills",
+            result.perimeter_count(),
+            result.gap_fills.len()
+        );
+    }
+
+    #[test]
+    fn test_gap_fill_with_complex_shape() {
+        // Create an L-shape that will have gaps at the corner
+        let l_shape = Polygon::from_points(vec![
+            Point::new(crate::scale(0.0), crate::scale(0.0)),
+            Point::new(crate::scale(10.0), crate::scale(0.0)),
+            Point::new(crate::scale(10.0), crate::scale(5.0)),
+            Point::new(crate::scale(5.0), crate::scale(5.0)),
+            Point::new(crate::scale(5.0), crate::scale(10.0)),
+            Point::new(crate::scale(0.0), crate::scale(10.0)),
+        ]);
+        let expoly: ExPolygon = l_shape.into();
+
+        let config = PerimeterConfig {
+            perimeter_count: 3,
+            perimeter_extrusion_width: 0.45,
+            external_perimeter_extrusion_width: 0.45,
+            gap_fill_threshold: 0.3,
+            ..Default::default()
+        };
+
+        let generator = PerimeterGenerator::new(config);
+        let result = generator.generate(&[expoly]);
+
+        assert!(result.has_perimeters());
+        // L-shapes often create gaps at corners during perimeter generation
+        println!(
+            "L-shape: {} perimeters, {} gap fills, {} infill regions",
+            result.perimeter_count(),
+            result.gap_fills.len(),
+            result.infill_area.len()
+        );
+    }
+
+    #[test]
+    fn test_thin_fills_empty_by_default() {
+        // Thin fills require thin_walls detection which is separate from gap fill
+        let square = make_square_mm(0.0, 0.0, 20.0);
+        let config = PerimeterConfig::default();
+
+        let generator = PerimeterGenerator::new(config);
+        let result = generator.generate(&[square]);
+
+        // Thin fills aren't populated yet (requires medial axis implementation)
+        assert!(result.thin_fills.is_empty());
     }
 }

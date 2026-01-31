@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://helio-additive.com/slicer/schemas/slice_config.schema.json",
+  "$id": "slicer/schemas/slice_config.schema.json",
   "title": "Slice Configuration",
   "description": "Configuration for a single slice job combining printer, filament, and print settings",
   "type": "object",

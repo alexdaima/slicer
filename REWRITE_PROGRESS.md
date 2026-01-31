@@ -2,7 +2,7 @@
 
 Comprehensive tracking document for the BambuStudio/libslic3r → Rust rewrite.
 
-**Last Updated:** 2025-01-22 (Session 29)
+**Last Updated:** 2025-01-24 (Session 31)
 
 ---
 
@@ -479,6 +479,124 @@ approx = "0.5"              # Float comparisons in tests
 ---
 
 ## Changelog
+
+### 2025-01-24 (Session 31) - Gap Fill Detection Implementation
+
+**Implemented Gap Fill Detection:**
+- Added morphological operations to `clipper/mod.rs`:
+  - `opening()` - morphological opening (shrink then grow)
+  - `closing()` - morphological closing (grow then shrink)
+  - `offset2()` - general shrink/grow operation for perimeter generation
+  - `detect_gaps()` - detects narrow gaps between polygon sets
+  - `extract_centerlines()` - approximates medial axis for gap regions
+- Updated `perimeter/mod.rs` to detect gaps during perimeter generation:
+  - Gap detection enabled when `gap_fill_threshold > 0`
+  - Uses offset2 for internal perimeters to enable proper gap detection
+  - Accumulates gaps across perimeter levels
+  - Processes gaps into gap fill polylines using centerline extraction
+- Updated `gcode/path.rs` to convert gap fills to extrusion paths:
+  - Gap fills use `ExtrusionRole::GapFill`
+  - Gap fills use reduced width (0.7x perimeter width)
+  - Thin fills also converted (0.5x perimeter width)
+
+**Gap Fill Algorithm (from BambuStudio):**
+1. During perimeter offset, detect areas that become too narrow
+2. Gaps = diff(offset(last, -0.5*distance), offset(new, 0.5*distance + safety))
+3. Collapse gaps using morphological opening to remove tiny regions
+4. Extract centerlines using offset-based approximation
+5. Filter out very short gap fills below threshold
+
+**Tests Added:**
+- `test_opening` - morphological opening preserves approximate area
+- `test_closing` - morphological closing preserves approximate area
+- `test_offset2` - offset2 with equal shrink/grow preserves shape
+- `test_offset2_removes_thin_features` - thin protrusions are removed
+- `test_detect_gaps_no_gaps` - concentric squares, no crashes
+- `test_detect_gaps_empty_inputs` - handles empty input gracefully
+- `test_extract_centerlines_simple` - narrow rectangle centerline
+- `test_gap_fill_detection_disabled_by_default` - gap fills empty when threshold=0
+- `test_gap_fill_detection_enabled` - thin rectangle generates perimeters
+- `test_gap_fill_with_complex_shape` - L-shape corner gap detection
+- `test_thin_fills_empty_by_default` - thin fills require medial axis (not yet implemented)
+
+**Files Changed:**
+- `clipper/mod.rs` - Added morphological operations and gap detection utilities
+- `perimeter/mod.rs` - Integrated gap fill detection into perimeter generation
+- `gcode/path.rs` - Added gap fill and thin fill path conversion
+
+**Test Status:** 994 tests passing
+
+**Next Steps for Extrusion Parity:**
+1. **HIGH: Investigate excess infill generation** - still generating ~2x paths vs reference
+2. **MEDIUM: Add first layer line width** - use 0.5mm for initial layer
+3. **MEDIUM: Improve bridge detection** - match BambuStudio's algorithm
+4. **LOW: Implement full medial axis** - for proper thin wall detection
+5. **LOW: Add LINE_WIDTH comments** - cosmetic but helps debugging
+
+
+### 2025-01-23 (Session 30) - Extrusion Parity Investigation & Arc Fitting CLI
+
+**Added Arc Fitting CLI Options:**
+- Added `--arc-fitting` flag to enable G2/G3 arc commands in output
+- Added `--arc-tolerance` option (default 0.05mm) for arc fitting precision
+- Arc fitting dramatically reduces G-code file size (392k lines → 66k lines)
+- Our output generates ~21k arcs vs reference's ~12k arcs (more aggressive fitting)
+
+**Extrusion Parity Analysis:**
+- Total extrusion is 56.8% higher than BambuStudio reference (7266mm vs 4634mm)
+- First layer specifically shows 2.1x more extrusion (74mm vs 35mm E values)
+- Feature breakdown differences on first layer:
+  - Outer walls: 10 (ours) vs 6 (reference)
+  - Inner walls: 2 (ours) vs 5 (reference)
+  - Internal solid infill: 12 (ours) vs 0 (reference)
+  - Bottom surface: 0 (ours) vs 3 (reference)
+  - Gap infill: 0 (ours) vs 4 (reference)
+
+**Root Cause Analysis - CRITICAL FINDING:**
+- E-per-mm calculation verified correct (~0.034 mm/mm for 0.45mm width, 0.2mm height)
+- **The issue is path length, NOT E calculation**
+- First layer path length: ~1694mm (ours) vs ~921mm (reference) = 1.84x more paths!
+- We're generating almost twice as many paths as needed
+- Infill features: 12 (ours) vs 7 (reference) - extra solid infill is the main culprit
+- Gap fill: 0 (ours) vs 4 (reference) - we don't generate gap fill at all
+- Bridge detection nearly non-functional (16 vs 1536 bridge moves)
+
+**Specific Issues Identified:**
+1. **Excessive solid infill generation** - generating infill in areas that shouldn't have it
+2. **Missing gap fill** - PerimeterResult.gap_fills and thin_fills exist but aren't populated
+3. **No first layer width differentiation** - reference uses 0.5mm, we use 0.45mm
+4. **Bridge detection failure** - almost no bridges detected compared to reference
+
+**Key Differences from Reference:**
+1. Reference line widths:
+   - outer_wall_line_width = 0.42mm
+   - inner_wall_line_width = 0.45mm
+   - initial_layer_line_width = 0.5mm (we use same as regular layers)
+   - sparse_infill_line_width = 0.45mm
+2. Reference uses wall_sequence = "inner wall/outer wall" (inner first)
+3. Reference emits LINE_WIDTH comments per feature
+4. Reference has proper bottom surface classification vs our generic solid infill
+
+**Bugs Fixed:**
+- Applied flow_mult to all segments in `extrude_path_with_arcs()`, not just closing segment
+- Added arc endpoint radius validation in `fit_arc_to_points()` to reject malformed arcs
+
+**Quality Score:** 57.9/100 (threshold: 70.0)
+
+**Files Changed:**
+- `main.rs` - Added `--arc-fitting` and `--arc-tolerance` CLI options
+- `pipeline/mod.rs` - Fixed flow_mult application in arc extrusion
+- `gcode/arc_fitting.rs` - Added endpoint radius validation for arc fitting
+
+**Next Steps for Extrusion Parity (Priority Order):**
+1. **HIGH: Investigate excess infill generation** - why 12 infill regions vs 7?
+   - Check if infill area calculation is merging/deduplicating correctly
+   - Verify we're not filling perimeter interior regions
+2. **HIGH: Implement gap fill detection** - populate PerimeterResult.gap_fills
+3. **MEDIUM: Add first layer line width** - use 0.5mm for initial layer
+4. **MEDIUM: Improve bridge detection** - match BambuStudio's algorithm
+5. **LOW: Add LINE_WIDTH comments** - cosmetic but helps debugging
+6. **LOW: Surface classification** - "Bottom surface" vs "Internal solid infill"
 
 ### 2025-01-22 (Session 29) - Extrusion Width Fix & Layer Marker Detection Improvements
 
