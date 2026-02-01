@@ -192,6 +192,27 @@ impl Polyline {
         BoundingBox::from_points(&self.points)
     }
 
+    /// Calculate the center point's projection onto a direction vector.
+    /// Used for sorting polylines by their position along a sweep direction.
+    pub fn center_projection(&self, cos_a: f64, sin_a: f64) -> f64 {
+        if self.points.is_empty() {
+            return 0.0;
+        }
+
+        // Calculate centroid
+        let mut cx = 0i64;
+        let mut cy = 0i64;
+        for p in &self.points {
+            cx += p.x;
+            cy += p.y;
+        }
+        cx /= self.points.len() as i64;
+        cy /= self.points.len() as i64;
+
+        // Project onto direction vector
+        cx as f64 * cos_a + cy as f64 * sin_a
+    }
+
     /// Find the closest point on the polyline to the given point.
     pub fn closest_point(&self, p: &Point) -> Point {
         if self.points.is_empty() {

@@ -51,29 +51,31 @@ export class GCodeParser {
     let maxExtrusion = 0;
 
     for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
+      const line = lines[i];
       if (!line) continue;
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
       
       // Handle comments that contain feature type info (before skipping)
-      if (line.startsWith(';')) {
+      if (trimmedLine.startsWith(';')) {
         // Handle feature type comments (Cura, PrusaSlicer, BambuStudio)
-        if (line.includes(';TYPE:')) {
-          const match = line.match(/;TYPE:(.+)/);
-          if (match) {
+        if (trimmedLine.includes(';TYPE:')) {
+          const match = trimmedLine.match(/;TYPE:(.+)/);
+          if (match?.[1]) {
             this.state.currentFeature = this.mapFeatureType(match[1].trim());
           }
         }
         // Handle feature comments from BambuStudio
-        else if (line.includes('; FEATURE:')) {
-          const match = line.match(/; FEATURE:(.+)/);
-          if (match) {
+        else if (trimmedLine.includes('; FEATURE:')) {
+          const match = trimmedLine.match(/; FEATURE:(.+)/);
+          if (match?.[1]) {
             this.state.currentFeature = this.mapFeatureType(match[1].trim());
           }
         }
         continue;
       }
 
-      const newSegments = this.parseLine(line, i + 1);
+      const newSegments = this.parseLine(trimmedLine, i + 1);
       if (newSegments.length > 0) {
         segments.push(...newSegments);
 
@@ -121,29 +123,31 @@ export class GCodeParser {
     const segments: GCodeSegment[] = [];
     
     for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
+      const line = lines[i];
       if (!line) continue;
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
       
       // Handle comments that contain feature type info (before skipping)
-      if (line.startsWith(';')) {
+      if (trimmedLine.startsWith(';')) {
         // Handle feature type comments (Cura, PrusaSlicer, BambuStudio)
-        if (line.includes(';TYPE:')) {
-          const match = line.match(/;TYPE:(.+)/);
-          if (match) {
+        if (trimmedLine.includes(';TYPE:')) {
+          const match = trimmedLine.match(/;TYPE:(.+)/);
+          if (match?.[1]) {
             this.state.currentFeature = this.mapFeatureType(match[1].trim());
           }
         }
         // Handle feature comments from BambuStudio
-        else if (line.includes('; FEATURE:')) {
-          const match = line.match(/; FEATURE:(.+)/);
-          if (match) {
+        else if (trimmedLine.includes('; FEATURE:')) {
+          const match = trimmedLine.match(/; FEATURE:(.+)/);
+          if (match?.[1]) {
             this.state.currentFeature = this.mapFeatureType(match[1].trim());
           }
         }
         continue;
       }
 
-      const newSegments = this.parseLine(line, startIndex + i + 1);
+      const newSegments = this.parseLine(trimmedLine, startIndex + i + 1);
       segments.push(...newSegments);
     }
     
@@ -474,6 +478,7 @@ export class GCodeParser {
       } else {
         // Use end of previous segment to ensure perfect connection
         const prevSeg = segments[segments.length - 1];
+        if (!prevSeg) throw new Error('No previous segment found for arc interpolation');
         segStartX = prevSeg.end.x;
         segStartY = prevSeg.end.y;
         segStartZ = prevSeg.end.z;
@@ -524,7 +529,7 @@ export class GCodeParser {
 
   private extractCommand(line: string): string | null {
     const match = line.match(/^([GM]\d+(?:\.\d+)?)/i);
-    return match ? match[1].toUpperCase() : null;
+    return match?.[1]?.toUpperCase() ?? null;
   }
 
   private extractParams(line: string): Record<string, number> {
@@ -533,10 +538,13 @@ export class GCodeParser {
     let match: RegExpExecArray | null;
     // biome-ignore lint/suspicious/noAssignInExpressions: regex iteration
     while ((match = regex.exec(line)) !== null) {
-      const key = match[1].toLowerCase();
-      const value = Number.parseFloat(match[2]);
-      if (!Number.isNaN(value)) {
-        params[key] = value;
+      const key = match[1]?.toLowerCase();
+      const valueStr = match[2];
+      if (key && valueStr) {
+        const value = Number.parseFloat(valueStr);
+        if (!Number.isNaN(value)) {
+          params[key] = value;
+        }
       }
     }
     

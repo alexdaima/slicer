@@ -34,6 +34,7 @@ use crate::config::{
     InfillPattern as ConfigInfillPattern, PerimeterMode, PrintConfig, PrintObjectConfig,
     SeamPosition as ConfigSeamPosition,
 };
+use crate::flow::Flow;
 use crate::gcode::{
     ArcFitter, ArcFittingConfig, ExtrusionPath, ExtrusionRole, GCode, GCodeWriter, LayerPaths,
     PathConfig, PathGenerator, PathSegment, SeamPosition,
@@ -270,6 +271,7 @@ impl PipelineConfig {
             external_width,
             layer_height,
             perimeter_count,
+            self.print.nozzle_diameter,
         );
 
         // Apply additional settings
@@ -280,8 +282,9 @@ impl PipelineConfig {
         config.join_type = crate::clipper::OffsetJoinType::Miter;
 
         // BambuStudio: surface simplification before perimeter generation
-        // Default resolution is 0.01mm. When arc fitting is enabled, use finer resolution.
-        config.surface_simplify_resolution = 0.01; // BambuStudio default
+        // Use 0.05mm resolution to reduce point count while maintaining quality.
+        // The original 0.01mm was too fine, causing 8x more points than needed.
+        config.surface_simplify_resolution = 0.05;
         config.arc_fitting_enabled = self.print.arc_fitting_enabled;
 
         config
@@ -344,6 +347,7 @@ impl PipelineConfig {
             max_radius: self.print.arc_fitting_max_radius,
             min_points: 3,
             max_arc_angle: std::f64::consts::PI * 1.5,
+            arc_length_tolerance_percent: 0.05, // 5% - matches BambuStudio DEFAULT_ARC_LENGTH_PERCENT_TOLERANCE
             enabled: self.print.arc_fitting_enabled,
         }
     }
@@ -562,8 +566,8 @@ impl Wipe {
             total_wipe_len += len;
         }
 
-        // Write wipe comment
-        writer.write_raw("; WIPE");
+        // Write wipe start marker (BambuStudio format for validation)
+        writer.write_raw("; WIPE_START");
 
         // Move along wipe path while retracting
         for i in 1..trimmed_path.len() {
@@ -581,6 +585,9 @@ impl Wipe {
                 Some(travel_speed * 60.0),
             );
         }
+
+        // Write wipe end marker (BambuStudio format for validation)
+        writer.write_raw("; WIPE_END");
 
         true
     }
@@ -978,8 +985,22 @@ impl PrintPipeline {
             return Ok(LayerPaths::new(layer_index, z_height, layer_height));
         }
 
+        // DEBUG: Layer-specific perimeter tracking
+        eprintln!(
+            "[LAYER {}] Starting perimeter generation with {} slices",
+            layer_index,
+            slices.len()
+        );
+
         // Generate perimeters
         let perimeter_result = perimeter_gen.generate(&slices);
+
+        // DEBUG: Report perimeter results for this layer
+        eprintln!(
+            "[LAYER {}] Generated {} perimeter loops",
+            layer_index,
+            perimeter_result.perimeters.len()
+        );
 
         // Determine if this layer has any solid surfaces
         let has_solid = surfaces.iter().any(|s| s.is_solid());
@@ -2037,6 +2058,9 @@ impl PrintPipeline {
             1.0
         };
 
+        // Prefer Flow-based calculation if available
+        let use_flow = path.flow.as_ref();
+
         for i in 1..path.points.len() {
             let from = path.points[i - 1];
             let to = path.points[i];
@@ -2053,8 +2077,13 @@ impl PrintPipeline {
             }
 
             // Calculate extrusion with flow multiplier applied
-            let e_for_segment =
-                self.calculate_e_for_distance(segment_length, width, height) * flow_mult;
+            let e_for_segment = if let Some(flow) = use_flow {
+                // Use Flow object for accurate calculation
+                self.calculate_e_from_flow(segment_length, flow) * flow_mult
+            } else {
+                // Fallback to width/height-based calculation
+                self.calculate_e_for_distance(segment_length, width, height) * flow_mult
+            };
             current_e += e_for_segment;
 
             writer.extrude_to(to_mm.0, to_mm.1, current_e, Some(feedrate));
@@ -2074,8 +2103,13 @@ impl PrintPipeline {
                 let segment_length = (dx * dx + dy * dy).sqrt();
 
                 if segment_length > 0.001 {
-                    let e_for_segment =
-                        self.calculate_e_for_distance(segment_length, width, height) * flow_mult;
+                    let e_for_segment = if let Some(flow) = use_flow {
+                        // Use Flow object for accurate calculation
+                        self.calculate_e_from_flow(segment_length, flow) * flow_mult
+                    } else {
+                        // Fallback to width/height-based calculation
+                        self.calculate_e_for_distance(segment_length, width, height) * flow_mult
+                    };
                     current_e += e_for_segment;
                     writer.extrude_to(first_mm.0, first_mm.1, current_e, Some(feedrate));
                 }
@@ -2101,6 +2135,9 @@ impl PrintPipeline {
         } else {
             1.0
         };
+
+        // Prefer Flow-based calculation if available
+        let use_flow = path.flow.as_ref();
 
         // Convert path points to PointF for arc fitting
         let points: Vec<PointF> = path
@@ -2134,9 +2171,11 @@ impl PrintPipeline {
                             continue;
                         }
 
-                        let e_for_segment =
-                            self.calculate_e_for_distance(segment_length, width, height)
-                                * flow_mult;
+                        let e_for_segment = if let Some(flow) = use_flow {
+                            self.calculate_e_from_flow(segment_length, flow) * flow_mult
+                        } else {
+                            self.calculate_e_for_distance(segment_length, width, height) * flow_mult
+                        };
                         current_e += e_for_segment;
 
                         writer.extrude_to(to.x, to.y, current_e, Some(feedrate));
@@ -2145,8 +2184,11 @@ impl PrintPipeline {
                 PathSegment::Arc(arc) => {
                     // Calculate extrusion for the arc
                     let arc_length = arc.arc_length();
-                    let e_for_arc =
-                        self.calculate_e_for_distance(arc_length, width, height) * flow_mult;
+                    let e_for_arc = if let Some(flow) = use_flow {
+                        self.calculate_e_from_flow(arc_length, flow) * flow_mult
+                    } else {
+                        self.calculate_e_for_distance(arc_length, width, height) * flow_mult
+                    };
                     current_e += e_for_arc;
 
                     // Write arc move
@@ -2173,8 +2215,11 @@ impl PrintPipeline {
             let segment_length = (dx * dx + dy * dy).sqrt();
 
             if segment_length > 0.001 {
-                let e_for_segment =
-                    self.calculate_e_for_distance(segment_length, width, height) * flow_mult;
+                let e_for_segment = if let Some(flow) = use_flow {
+                    self.calculate_e_from_flow(segment_length, flow) * flow_mult
+                } else {
+                    self.calculate_e_for_distance(segment_length, width, height) * flow_mult
+                };
                 current_e += e_for_segment;
                 writer.extrude_to(first.x, first.y, current_e, Some(feedrate));
             }
@@ -2200,6 +2245,38 @@ impl PrintPipeline {
 
         // Volume = cross-section × distance
         let volume = cross_section * distance;
+
+        // E = volume / filament_area
+        // filament_area = π × (diameter/2)²
+        let filament_radius = self.config.print.filament_diameter / 2.0;
+        let filament_area = std::f64::consts::PI * filament_radius * filament_radius;
+
+        let e = volume / filament_area;
+
+        // Apply extrusion multiplier
+        e * self.config.print.extrusion_multiplier
+    }
+
+    /// Calculate E (extrusion length) using a Flow object.
+    ///
+    /// This is the preferred method for E-value calculation as it uses
+    /// the exact same formula as BambuStudio's Flow::mm3_per_mm().
+    ///
+    /// # Arguments
+    ///
+    /// * `distance` - Travel distance in mm
+    /// * `flow` - Flow object containing width, height, and proper spacing calculations
+    ///
+    /// # Returns
+    ///
+    /// E-value (filament length in mm) to extrude for the given distance
+    fn calculate_e_from_flow(&self, distance: CoordF, flow: &Flow) -> CoordF {
+        // Get volume per mm from Flow (this uses the rounded rectangle formula)
+        // Use unchecked version since Flow objects from perimeter generation are pre-validated
+        let mm3_per_mm = flow.mm3_per_mm_unchecked();
+
+        // Volume = mm3_per_mm × distance
+        let volume = mm3_per_mm * distance;
 
         // E = volume / filament_area
         // filament_area = π × (diameter/2)²

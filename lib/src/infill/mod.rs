@@ -1697,82 +1697,78 @@ impl InfillGenerator {
     }
 
     /// Connect adjacent infill lines to reduce travel.
+    /// Improved algorithm for solid infill: sorts segments by position along
+    /// the sweep direction before connecting adjacent ones.
     fn connect_infill_lines(&self, paths: Vec<InfillPath>) -> Vec<InfillPath> {
         if paths.len() < 2 {
             return paths;
         }
 
-        // Simple greedy connection: for each line, find the nearest endpoint
-        // of the next unconnected line and connect them
+        // Convert all paths to polylines for processing
+        let mut polylines: Vec<Polyline> = paths
+            .into_iter()
+            .map(|p| p.to_polyline())
+            .filter(|p| p.len() >= 2)
+            .collect();
+
+        if polylines.is_empty() {
+            return Vec::new();
+        }
+
+        // Get the angle to determine sweep direction
+        let angle_rad = self.config.angle.to_radians();
+        let cos_a = angle_rad.cos();
+        let sin_a = angle_rad.sin();
+
+        // Threshold for connection: 2.5× extrusion width
+        let connect_threshold = scale(self.config.extrusion_width * 2.5);
+
+        // Sort polylines by their projection onto the sweep direction
+        // This groups collinear segments together
+        polylines.sort_by(|a, b| {
+            let a_center = a.center_projection(cos_a, sin_a);
+            let b_center = b.center_projection(cos_a, sin_a);
+            a_center
+                .partial_cmp(&b_center)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         let mut connected = Vec::new();
-        let mut used = vec![false; paths.len()];
+        let mut current_path = polylines[0].clone();
 
-        // Start with the first path
-        let mut current_path = paths[0].to_polyline();
-        used[0] = true;
-        let mut remaining = paths.len() - 1;
+        for next_poly in polylines.into_iter().skip(1) {
+            // Check if next segment is close enough to connect
+            let current_end = current_path.last_point();
+            let next_start = next_poly.points()[0];
+            let next_end = next_poly.points()[next_poly.points().len() - 1];
 
-        let connect_threshold = scale(self.config.extrusion_width * 2.0);
+            // Calculate distances to both ends of next segment
+            let dist_to_start = ((next_start.x - current_end.x) as f64)
+                .hypot((next_start.y - current_end.y) as f64)
+                as i64;
+            let dist_to_end = ((next_end.x - current_end.x) as f64)
+                .hypot((next_end.y - current_end.y) as f64) as i64;
 
-        while remaining > 0 {
-            let end_point = if current_path.is_empty() {
-                None
+            // Check if they're roughly collinear (projection difference small)
+            let current_center = current_path.center_projection(cos_a, sin_a);
+            let next_center = next_poly.center_projection(cos_a, sin_a);
+            let projection_diff = (current_center - next_center).abs() as i64;
+
+            // Connect if close enough AND roughly on same sweep line
+            let min_dist = dist_to_start.min(dist_to_end);
+            if min_dist <= connect_threshold
+                && projection_diff <= scale(self.config.extrusion_width * 0.5)
+            {
+                // Determine which direction to connect
+                let mut next_to_append = next_poly;
+                if dist_to_end < dist_to_start {
+                    next_to_append.reverse();
+                }
+                current_path.append(&next_to_append);
             } else {
-                Some(current_path.last_point())
-            };
-
-            // Find the nearest unconnected path endpoint
-            let mut best_idx = None;
-            let mut best_dist = i64::MAX;
-            let mut reverse_best = false;
-
-            for (i, path) in paths.iter().enumerate() {
-                if used[i] {
-                    continue;
-                }
-
-                if let Some(end) = end_point {
-                    if let (Some(start), Some(path_end)) = (path.start_point(), path.end_point()) {
-                        let dist_to_start = (start.x - end.x).abs().max((start.y - end.y).abs());
-                        let dist_to_end =
-                            (path_end.x - end.x).abs().max((path_end.y - end.y).abs());
-
-                        if dist_to_start < best_dist {
-                            best_dist = dist_to_start;
-                            best_idx = Some(i);
-                            reverse_best = false;
-                        }
-                        if dist_to_end < best_dist {
-                            best_dist = dist_to_end;
-                            best_idx = Some(i);
-                            reverse_best = true;
-                        }
-                    }
-                }
-            }
-
-            if let Some(idx) = best_idx {
-                used[idx] = true;
-                remaining -= 1;
-
-                // Check if we should connect or start a new path
-                if best_dist <= connect_threshold {
-                    // Connect to current path
-                    let mut next_path = paths[idx].to_polyline();
-                    if reverse_best {
-                        next_path.reverse();
-                    }
-                    current_path.append(&next_path);
-                } else {
-                    // Too far, save current and start new
-                    connected.push(InfillPath::Line(current_path));
-                    current_path = paths[idx].to_polyline();
-                    if reverse_best {
-                        current_path.reverse();
-                    }
-                }
-            } else {
-                break;
+                // Too far or different sweep line, save current and start new
+                connected.push(InfillPath::Line(current_path));
+                current_path = next_poly;
             }
         }
 

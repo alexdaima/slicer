@@ -9,6 +9,7 @@ import { OrbitControls, Box } from '@react-three/drei';
 import * as THREE from 'three';
 import type { GCodeSegment, ParsedGCode, FeatureType } from '../types/gcode';
 import { FEATURE_COLORS, FEATURE_OPACITY } from '../types/gcode';
+import { Nozzle } from './Nozzle';
 
 interface GCodeRendererProps {
   parsedGCode: ParsedGCode;
@@ -16,6 +17,8 @@ interface GCodeRendererProps {
   lineWidth?: number;
   showTravelMoves?: boolean;
   segmentLimit?: number;
+  nozzlePosition?: [number, number, number];
+  showNozzle?: boolean;
 }
 
 // Color cache to avoid repeated color parsing
@@ -68,9 +71,8 @@ const GCodeTubes: React.FC<GCodeRendererProps> = ({
         if (layerIndex < minLayer || layerIndex > maxLayer) continue;
       }
 
-      // Include extrude moves and travel moves for outer-wall (to fill gaps)
-      const isOuterWallTravel = segment.featureType === 'outer-wall' && segment.type !== 'extrude';
-      if (segment.type !== 'extrude' && !isOuterWallTravel) continue;
+      // Only render extrusion moves (travel moves create ring artifacts at corners)
+      if (segment.type !== 'extrude') continue;
 
       const feature = segment.featureType || 'custom';
       if (!instances.has(feature)) {
@@ -97,15 +99,18 @@ const GCodeTubes: React.FC<GCodeRendererProps> = ({
       const dz = end.z - start.z;
       const length = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-      if (length < 0.001) continue;
+      // Filter out very short segments to prevent overlapping geometry artifacts
+      // Minimum length of 0.05mm prevents "ring" appearance from overlapping cylinders
+      if (length < 0.05) continue;
 
       // Calculate orientation
       const direction = new THREE.Vector3(dx, dy, dz).normalize();
       quaternion.setFromUnitVectors(up, direction);
 
-      // Scale: thin radius for outer-wall travel moves, full width for extrusions
+      // Scale: thin radius for outer-wall travel moves, reduced width for extrusions
+      // Using 0.6 * extrusionWidth/2 to minimize overlapping at corners
       const isTravel = segment.type !== 'extrude';
-      const radius = isTravel ? 0.05 : (segment.extrusionWidth || 0.4) / 2;
+      const radius = isTravel ? 0.03 : (segment.extrusionWidth || 0.4) * 0.3;
       scale.set(radius, length, radius);
 
       // Build matrix
@@ -149,8 +154,12 @@ const GCodeTubes: React.FC<GCodeRendererProps> = ({
 
       // Set matrices and colors
       for (let i = 0; i < data.matrices.length; i++) {
-        instancedMesh.setMatrixAt(i, data.matrices[i]);
-        instancedMesh.setColorAt(i, data.colors[i]);
+        const matrix = data.matrices[i];
+        const color = data.colors[i];
+        if (matrix && color) {
+          instancedMesh.setMatrixAt(i, matrix);
+          instancedMesh.setColorAt(i, color);
+        }
       }
       
       instancedMesh.instanceMatrix.needsUpdate = true;
@@ -230,6 +239,7 @@ const GCodeLineSegments: React.FC<GCodeRendererProps> = ({
       
       for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
+        if (!seg) continue;
         const idx = i * 6;
         positions[idx] = seg.start.x;
         positions[idx + 1] = seg.start.y;
@@ -361,6 +371,8 @@ export const GCodeScene: React.FC<GCodeSceneProps> = ({
   lineWidth,
   showTravelMoves,
   segmentLimit,
+  nozzlePosition,
+  showNozzle = false,
 }) => {
   const center = useMemo(() => [
     (parsedGCode.bounds.min.x + parsedGCode.bounds.max.x) / 2,
@@ -401,7 +413,7 @@ export const GCodeScene: React.FC<GCodeSceneProps> = ({
 
   return (
     <>
-      <color attach="background" args={['#1a1a1a']} />
+      <color attach="background" args={['#0f0f0f']} />
       
       <ambientLight intensity={0.4} />
       <directionalLight 
@@ -417,9 +429,19 @@ export const GCodeScene: React.FC<GCodeSceneProps> = ({
       <pointLight position={[0, 0, 50]} intensity={0.5} />
       
       <group rotation={[-Math.PI / 2, 0, 0]}>
-        <group position={[-center[0], -center[1], -center[2]]}>
+        <group position={[-(center[0] ?? 0), -(center[1] ?? 0), -(center[2] ?? 0)]}>
           {renderContent}
           {showBoundingBox && <BoundingBox parsedGCode={parsedGCode} />}
+          {showNozzle && nozzlePosition && (
+            <Nozzle 
+              position={[
+                nozzlePosition[0],
+                nozzlePosition[1],
+                nozzlePosition[2]
+              ]} 
+              visible={showNozzle} 
+            />
+          )}
         </group>
       </group>
       
@@ -501,8 +523,8 @@ export const GCodeViewer: React.FC<GCodeViewerProps> = ({
         gl={{ 
           antialias: true, 
           alpha: false,
-          shadowMap: { enabled: true, type: THREE.PCFSoftShadowMap }
         }}
+        shadows
         dpr={[1, 2]}
         performance={{ min: 0.5 }}
       >

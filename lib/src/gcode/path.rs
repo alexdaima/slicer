@@ -154,6 +154,14 @@ pub struct ExtrusionPath {
 
     /// Print speed for this path (mm/s).
     pub speed: CoordF,
+
+    /// Flow object for accurate E-value calculation.
+    ///
+    /// When present, this should be used for extrusion calculations via
+    /// `flow.mm3_per_mm()` rather than the simple width × height formula.
+    /// This ensures proper rounded rectangle cross-section calculations
+    /// matching BambuStudio's Flow.cpp.
+    pub flow: Option<Flow>,
 }
 
 impl ExtrusionPath {
@@ -167,6 +175,7 @@ impl ExtrusionPath {
             height: 0.2,
             flow_multiplier: 1.0,
             speed: 60.0, // mm/s default
+            flow: None,
         }
     }
 
@@ -201,6 +210,12 @@ impl ExtrusionPath {
     /// Set the print speed.
     pub fn with_speed(mut self, speed: CoordF) -> Self {
         self.speed = speed;
+        self
+    }
+
+    /// Set the Flow object for accurate extrusion calculations.
+    pub fn with_flow_object(mut self, flow: Flow) -> Self {
+        self.flow = Some(flow);
         self
     }
 
@@ -290,8 +305,15 @@ impl ExtrusionPath {
     /// Get a Flow object representing this path's extrusion parameters.
     ///
     /// This provides access to all the flow calculation helpers from the
-    /// flow module.
+    /// flow module. If a Flow object was set via `with_flow_object()`, it
+    /// will be returned. Otherwise, a Flow is constructed on-demand from
+    /// width and height.
     pub fn flow(&self) -> Option<Flow> {
+        if let Some(ref flow) = self.flow {
+            return Some(flow.clone());
+        }
+
+        // Fallback: construct Flow from width/height
         if self.is_bridge() {
             // For bridges, width == height (circular)
             Some(Flow::bridging_flow(self.width, self.width))
@@ -732,11 +754,9 @@ impl PathGenerator {
                 ExtrusionRole::Perimeter
             };
 
-            let width = if loop_item.is_external {
-                self.config.external_perimeter_width
-            } else {
-                self.config.perimeter_width
-            };
+            // Use the actual extrusion width from the loop
+            // (which may be normal or smaller width for narrow loops)
+            let width = loop_item.extrusion_width;
 
             let speed = if loop_item.is_external {
                 self.config.external_perimeter_speed
@@ -749,10 +769,15 @@ impl PathGenerator {
             let simplified_polygon =
                 simplify_polygon_comprehensive(&loop_item.polygon, &simplify_config);
 
-            let path = ExtrusionPath::from_polygon(&simplified_polygon, role)
+            let mut path = ExtrusionPath::from_polygon(&simplified_polygon, role)
                 .with_width(width)
                 .with_height(layer_height)
                 .with_speed(speed);
+
+            // Use Flow from PerimeterLoop if available
+            if let Some(ref flow) = loop_item.flow {
+                path = path.with_flow_object(flow.clone());
+            }
 
             paths.push(path);
         }

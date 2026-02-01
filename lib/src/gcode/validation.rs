@@ -338,7 +338,7 @@ impl Default for ValidationConfig {
             weight_layer_consistency: 0.25,
             weight_coverage: 0.15,
             weight_features: 0.10,
-            pass_threshold: 70.0,
+            pass_threshold: 99.0,
             detailed_moves: false,
             classify_features: true,
         }
@@ -353,7 +353,7 @@ impl ValidationConfig {
             total_extrusion_tolerance: 0.05,
             layer_extrusion_tolerance: 0.10,
             z_tolerance: 0.001,
-            pass_threshold: 90.0,
+            pass_threshold: 99.5,
             detailed_moves: true,
             ..Default::default()
         }
@@ -2022,7 +2022,7 @@ mod tests {
         let config = ValidationConfig::default();
         assert!((config.layer_count_tolerance - 0.05).abs() < 1e-6);
         assert!((config.total_extrusion_tolerance - 0.10).abs() < 1e-6);
-        assert!((config.pass_threshold - 70.0).abs() < 1e-6);
+        assert!((config.pass_threshold - 99.0).abs() < 1e-6);
     }
 
     #[test]

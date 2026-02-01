@@ -4,6 +4,7 @@
  */
 
 import index from './index.html';
+import { POST as chatHandler } from './src/api/chat';
 
 const GCODE_PATH = '../data/reference_gcodes/3DBenchy.gcode';
 
@@ -30,6 +31,11 @@ Bun.serve({
         console.error('Error reading G-code file:', error);
         return new Response('Error reading G-code file', { status: 500 });
       }
+    },
+    
+    // AI Chat API endpoint
+    '/api/chat': {
+      POST: chatHandler,
     },
   },
   

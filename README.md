@@ -10,7 +10,9 @@ This work is based on BambuStudio by BambuLab, which is based on PrusaSlicer by 
 
 > **Last Updated:** 2026-02-01
 > 
-> **Quality Score: 70.5/100** (threshold: 70.0) ✅ **PASSED**
+> **Quality Score: 73.6/100** (threshold: 90.0) ❌ **NEEDS IMPROVEMENT**
+> 
+> **Test Suite:** 470 tests passing (398 unit + 72 integration)
 
 ### Rust vs C++ Code Coverage
 
@@ -25,43 +27,81 @@ This work is based on BambuStudio by BambuLab, which is based on PrusaSlicer by 
 | Metric | BambuStudio Reference | Rust Slicer | Status |
 |--------|----------------------|-------------|--------|
 | Layers | 240 | 240 | ✅ Exact match |
-| G-code lines | 132,424 | 111,390 | 🟡 84% of reference |
-| Filament | 3,869mm | ~3,640mm | ✅ Within 6% |
+| G-code lines | 132,424 | 93,650 | 🟡 71% of reference |
+| Filament | 4,634mm | ~6,634mm | 🔴 +43.1% (over-extrusion) |
 
 ### Feature Move Counts
 
 | Feature | Reference | Generated | Ratio | Status |
 |---------|-----------|-----------|-------|--------|
-| Bridge Infill | 1,536 | 1,802 | 1.17× | ✅ Close match |
-| External Perimeter | 28,702 | 26,011 | 0.91× | ✅ Close match |
-| Internal Perimeter | 10,318 | 27,825 | 2.7× | 🟡 Over-generation |
-| Solid Infill | 9,810 | 24,977 | 2.5× | 🟡 Over-generation |
-| Sparse Infill | 11,504 | 6,557 | 0.57× | 🟡 Under-generation |
-| Travel | 29,736 | 19,983 | 0.67× | 🟡 Different |
-| Wipe | 3,099 | Generated | - | ✅ Implemented |
+| Bridge Infill | 1,536 | 840 | 0.55× | 🔴 Under-generation |
+| External Perimeter | 28,702 | 17,080 | 0.59× | 🔴 Under-generation |
+| Internal Perimeter | 10,318 | 17,109 | 1.66× | 🔴 Over-generation |
+| Solid Infill | 9,810 | 11,678 | 1.19× | 🟡 Slight over-generation |
+| Sparse Infill | 11,504 | 4,120 | 0.36× | 🔴 Under-generation |
+| Travel | 29,736 | 29,192 | 0.98× | ✅ Close match |
+| Wipe | 3,099 | 5,751 | 1.86× | 🟡 Over-generation |
 
 ### Priority Issues
 
-1. **🟡 Internal Perimeter** - 2.7× over-generation (needs investigation)
-2. **🟡 Solid Infill** - 2.5× over-generation (needs investigation)
-3. **🟡 Sparse Infill** - Under-generation (57% of reference)
-4. **🟡 First Layer Height** - Z offset mismatch (0.4mm vs 0.2mm detected)
-5. **🟡 Travel Moves** - 33% fewer than reference (may affect print quality)
+1. **🔴 Internal Perimeter Over-Generation** - 1.66× more moves than reference (6,791 excess)
+   - Reduced from 2.7× (27,825 moves) to 1.66× (17,109 moves) ✅
+   - Still needs work but major improvement (-38% from Session 36)
+2. **🔴 External Perimeter Under-Generation** - Only 59% of reference (11,622 missing)
+   - Same as previous - may indicate simplification removing too much detail
+   - Could also be affected by smaller-width perimeter detection
+3. **🔴 Sparse Infill Under-Generation** - Only 36% of reference moves (7,384 missing)
+   - Surface classification marking areas as solid that should be sparse
+4. **🟡 Solid Infill Slight Over-Generation** - 1.19× reference (was 2.26×) ✅
+   - **Major improvement!** Reduced from 22,139 to 11,678 moves (-47%)
+   - Now only 19% over reference (1,868 excess)
+5. **🔴 Over-Extrusion** - 43.1% more filament than reference (was 49.9%) ✅
+   - Improved due to solid infill and internal perimeter reductions
+   - Direct result of remaining over-generation issues
+6. **🟡 Wipe Over-Generation** - 1.86× more wipe moves than needed (was 2.04×) ✅
+   - Wipe is working but still generating too frequently
+7. **🔴 Bridge Infill Under-Generation** - 0.55× reference (696 missing)
+   - Was 1.08× in previous session - regression detected
+   - May be related to surface detection changes
 
 ### Recent Improvements
 
-- **🎉 Quality Score: 70.5/100** - Now passes the 70.0 threshold!
-  - Implemented **Wipe Moves** feature (was 0, now generating correctly)
-  - Score improved from 52.8 to 70.5 (+17.7 points)
-  - G-code lines: 111,390 (84% of reference, up from 81%)
-- **Bridge Detection Fix** - Improved from 20 moves (1%) to 1,802 moves (117% of reference)
-  - Added anchor validation using BridgeDetector to filter true bridges from overhangs
-  - Added max bridge area filter (6mm²) to prevent large overhangs from being treated as bridges
-  - Enabled infill line connection to reduce fragmentation and travel moves
-- **Surface Simplification** - Added Douglas-Peucker simplification before perimeter generation (matching libslic3r behavior)
-- **G-code Size** - Reduced from 392K to 111K lines (72% reduction, now 84% of reference)
-- **External Perimeter** - Now within 9% of reference (was 7× over)
-- **Travel Moves** - Reduced from excessive fragmentation to 67% of reference
+- **🎉 Quality Score: 73.6/100** - Improved from 70.5 (+3.1 points) ✅
+- **✅ Smaller-Width External Perimeter Detection** (Session 36)
+  - Added narrow loop detection using `offset2()` morphological operation
+  - Uses 85% width for loops narrower than `(width + spacing) * 10mm`
+  - Matches BambuStudio's algorithm from `PerimeterGenerator.cpp:976-996`
+- **✅ Surface Reordering with chain_expolygons** (Session 36)
+  - Implemented greedy nearest-neighbor traveling salesman for surface ordering
+  - Matches BambuStudio's `ShortestPath.cpp` `chain_expolygons()`
+  - Should reduce travel distance between perimeters
+- **✅ Internal Perimeter Reduced** - Major improvement! ✨
+  - Reduced from 27,825 moves to 17,109 moves (-38.5%)
+  - Still 66% over reference but significant progress
+- **✅ Solid Infill Reduced** - Dramatic improvement! ✨
+  - Reduced from 22,139 to 11,678 moves (-47%)
+  - Now only 19% over reference (was 126% over)
+- **✅ Travel Moves Fixed** - Near perfect match! ✨
+  - Improved from 16,989 to 29,192 (was 57%, now 98%)
+  - Excellent parity with reference
+- **✅ Wipe Moves Fixed** - Changed comment format from `; WIPE` to `; WIPE_START`/`; WIPE_END`
+  - Now detecting 5,751 wipe moves (was 0)
+  - Still 1.86× more than reference but working correctly
+- **✅ Top Solid Layers Fixed** - Changed from 4 to 3 layers to match reference
+- **Test Suite** - All 470 tests passing (398 unit + 72 integration)
+  - Tree support: 25 integration tests passing ✅
+  - Multi-material: 26 integration tests passing ✅
+  - Benchy validation: 20 integration tests passing ✅
+
+### Known Issues
+
+- **Bridge Infill Regression** - Dropped from 1.08× to 0.55× (regression)
+  - 22,139 moves vs 9,810 reference (126% over)
+  - `connect_infill_lines()` algorithm not connecting properly
+  - May need greedy nearest-neighbor optimization or different connection strategy
+- **Surface Classification Imbalance** - Too much solid, too little sparse
+  - 22,139 solid infill moves but only 4,220 sparse (should be closer to 11,504)
+  - InternalSolid surface type being over-assigned
 
 ---
 

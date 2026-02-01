@@ -38,7 +38,7 @@ use crate::clipper::{
 };
 use crate::flow::Flow;
 use crate::geometry::simplify::douglas_peucker_polygon;
-use crate::geometry::{ExPolygon, ExPolygons, Polygon, Polyline};
+use crate::geometry::{ExPolygon, ExPolygons, Point, Polygon, Polyline};
 use crate::{scale, CoordF};
 
 /// Inset overlap tolerance for gap detection (same as BambuStudio).
@@ -56,6 +56,10 @@ pub struct PerimeterConfig {
     /// Extrusion width for external (outer) perimeters (mm).
     pub external_perimeter_extrusion_width: CoordF,
 
+    /// Extrusion width for smaller external perimeters in narrow regions (mm).
+    /// BambuStudio uses a reduced width for narrow loops to improve quality.
+    pub smaller_external_perimeter_width: CoordF,
+
     /// Spacing between internal perimeter centerlines (mm).
     /// This is typically less than width to account for overlap.
     /// Calculated as: width - height × (1 - π/4)
@@ -63,6 +67,9 @@ pub struct PerimeterConfig {
 
     /// Spacing for external perimeters (mm).
     pub external_perimeter_spacing: CoordF,
+
+    /// Spacing for smaller external perimeters (mm).
+    pub smaller_external_perimeter_spacing: CoordF,
 
     /// Spacing between external and first internal perimeter (mm).
     /// This is the average of external and internal spacing.
@@ -93,11 +100,27 @@ pub struct PerimeterConfig {
 
     /// Whether arc fitting will be used (affects simplification resolution).
     pub arc_fitting_enabled: bool,
+
+    // =========================================================================
+    // Flow objects (matching BambuStudio's PerimeterGenerator)
+    // =========================================================================
+    /// Flow for internal perimeters.
+    /// Reference: PerimeterGenerator::perimeter_flow
+    pub perimeter_flow: Flow,
+
+    /// Flow for external perimeters.
+    /// Reference: PerimeterGenerator::ext_perimeter_flow
+    pub ext_perimeter_flow: Flow,
+
+    /// Flow for smaller-width external perimeters (narrow loops).
+    /// Reference: PerimeterGenerator::smaller_ext_perimeter_flow
+    pub smaller_ext_perimeter_flow: Flow,
 }
 
 impl Default for PerimeterConfig {
     fn default() -> Self {
-        Self::new(0.45, 0.45, 0.2, 3)
+        // Default nozzle diameter of 0.4mm
+        Self::new(0.45, 0.45, 0.2, 3, 0.4)
     }
 }
 
@@ -109,11 +132,13 @@ impl PerimeterConfig {
     /// * `external_width` - Width of external perimeters (mm)
     /// * `layer_height` - Layer height (mm)
     /// * `perimeter_count` - Number of perimeters to generate
+    /// * `nozzle_diameter` - Nozzle diameter (mm), needed for Flow calculations
     pub fn new(
         perimeter_width: CoordF,
         external_width: CoordF,
         layer_height: CoordF,
         perimeter_count: usize,
+        nozzle_diameter: CoordF,
     ) -> Self {
         // Calculate spacing using the Flow module's formula:
         // spacing = width - height × (1 - π/4)
@@ -125,16 +150,39 @@ impl PerimeterConfig {
             Flow::rounded_rectangle_extrusion_spacing(external_width, layer_height)
                 .unwrap_or(external_width * 0.9);
 
+        // BambuStudio: Smaller external perimeter width for narrow loops
+        // Typically 85% of normal external width
+        let smaller_external_width = external_width * 0.85;
+        let smaller_external_spacing =
+            Flow::rounded_rectangle_extrusion_spacing(smaller_external_width, layer_height)
+                .unwrap_or(smaller_external_width * 0.9);
+
         // Spacing between external and first internal perimeter
         // BambuStudio uses: 0.5 × (ext_spacing + internal_spacing)
         let external_to_internal_spacing = 0.5 * (external_perimeter_spacing + perimeter_spacing);
+
+        // Create Flow objects for each perimeter type
+        // These match BambuStudio's PerimeterGenerator member variables
+        let perimeter_flow = Flow::new(perimeter_width, layer_height, nozzle_diameter)
+            .expect("Invalid perimeter flow parameters");
+
+        let ext_perimeter_flow = Flow::new(external_width, layer_height, nozzle_diameter)
+            .expect("Invalid external perimeter flow parameters");
+
+        // Smaller external perimeter flow for narrow loops
+        // BambuStudio creates this using with_width()
+        let smaller_ext_perimeter_flow = ext_perimeter_flow
+            .with_width(smaller_external_width)
+            .expect("Invalid smaller external perimeter flow parameters");
 
         Self {
             perimeter_count,
             perimeter_extrusion_width: perimeter_width,
             external_perimeter_extrusion_width: external_width,
+            smaller_external_perimeter_width: smaller_external_width,
             perimeter_spacing,
             external_perimeter_spacing,
+            smaller_external_perimeter_spacing: smaller_external_spacing,
             external_to_internal_spacing,
             layer_height,
             external_perimeters_first: false,
@@ -144,6 +192,9 @@ impl PerimeterConfig {
             join_type: OffsetJoinType::Miter,
             surface_simplify_resolution: 0.01, // BambuStudio default: 0.01mm
             arc_fitting_enabled: false,
+            perimeter_flow,
+            ext_perimeter_flow,
+            smaller_ext_perimeter_flow,
         }
     }
 
@@ -186,8 +237,17 @@ pub struct PerimeterLoop {
     /// Extrusion width for this perimeter (mm).
     pub extrusion_width: CoordF,
 
+    /// Whether this perimeter uses smaller width (for narrow loops).
+    pub is_smaller_width: bool,
+
     /// Depth/nesting level (for ordering).
     pub depth: usize,
+
+    /// Flow object for accurate E-value calculation.
+    ///
+    /// This Flow object from PerimeterConfig should be used for mm3_per_mm()
+    /// calculations to ensure proper extrusion matching BambuStudio's Flow.cpp.
+    pub flow: Option<crate::flow::Flow>,
 }
 
 impl PerimeterLoop {
@@ -205,7 +265,30 @@ impl PerimeterLoop {
             is_contour,
             perimeter_index,
             extrusion_width,
+            is_smaller_width: false,
             depth: 0,
+            flow: None,
+        }
+    }
+
+    /// Create a new perimeter loop with smaller width flag.
+    pub fn new_with_width_flag(
+        polygon: Polygon,
+        is_external: bool,
+        is_contour: bool,
+        perimeter_index: usize,
+        extrusion_width: CoordF,
+        is_smaller_width: bool,
+    ) -> Self {
+        Self {
+            polygon,
+            is_external,
+            is_contour,
+            perimeter_index,
+            extrusion_width,
+            is_smaller_width,
+            depth: 0,
+            flow: None,
         }
     }
 
@@ -332,14 +415,24 @@ impl PerimeterGenerator {
             return result;
         }
 
+        // DEBUG: Log how many slices we're processing
+        eprintln!(
+            "[PERIMETER DEBUG] generate() called with {} input expolygons",
+            slices.len()
+        );
+
+        // DEBUG: Track perimeter counts by level for detailed analysis
+        let mut debug_external_count = 0usize;
+        let mut debug_internal_count = 0usize;
+
         // BambuStudio: Simplify surface polygons before perimeter generation
         // This reduces the number of points significantly and speeds up processing.
         // Reference: PerimeterGenerator.cpp line 902, 933
-        // When arc fitting is enabled, use finer resolution (0.2×) since arc fitter will
-        // further reduce points during G-code generation.
+        // When arc fitting is enabled, use moderate resolution (0.5×) since arc fitter will
+        // further reduce points during G-code generation. Using 0.2× was too aggressive.
         let simplified_slices = if self.config.surface_simplify_resolution > 0.0 {
             let resolution = if self.config.arc_fitting_enabled {
-                self.config.surface_simplify_resolution * 0.2
+                self.config.surface_simplify_resolution * 0.5
             } else {
                 self.config.surface_simplify_resolution
             };
@@ -356,9 +449,13 @@ impl PerimeterGenerator {
         let mut accumulated_gaps: ExPolygons = Vec::new();
 
         // Current working area (starts as the simplified slices)
-        // Sort slices deterministically by bounding box for reproducible results
-        let mut current_area = simplified_slices;
-        Self::sort_expolygons_deterministic(&mut current_area);
+        // Reorder slices using nearest-neighbor for optimal travel
+        // Reference: BambuStudio PerimeterGenerator.cpp line 914
+        let reorder_indices = Self::chain_expolygons(&simplified_slices);
+        let mut current_area: ExPolygons = reorder_indices
+            .iter()
+            .map(|&idx| simplified_slices[idx].clone())
+            .collect();
 
         // Whether to detect gaps (enabled when gap_fill_threshold > 0)
         let detect_gap_fill = self.config.gap_fill_threshold > 0.0;
@@ -366,6 +463,13 @@ impl PerimeterGenerator {
         // Generate each perimeter level
         for perimeter_idx in 0..self.config.perimeter_count {
             let is_external = perimeter_idx == 0;
+
+            // DEBUG: Track iteration
+            eprintln!(
+                "[PERIMETER DEBUG] Iteration {}: current_area has {} expolygons",
+                perimeter_idx,
+                current_area.len()
+            );
 
             // Calculate the extrusion width for this perimeter
             let extrusion_width = if is_external {
@@ -397,25 +501,76 @@ impl PerimeterGenerator {
                 self.config.perimeter_spacing
             };
 
-            // BambuStudio: For internal perimeters, ALWAYS use offset2 (thin wall strategy)
-            // to remove narrow protrusions that would cause over-filling.
-            // This applies regardless of whether gap fill detection is enabled.
-            let perimeter_area = if perimeter_idx == 0 {
-                // External perimeter: simple shrink by half width from edge
-                shrink(&current_area, offset_distance, self.config.join_type)
+            // BambuStudio: For external perimeters, detect narrow loops that should use smaller width.
+            // For internal perimeters, ALWAYS use offset2 (thin wall strategy).
+            let mut perimeter_area = Vec::new();
+            let mut smaller_width_area = Vec::new();
+
+            if perimeter_idx == 0 {
+                // External perimeter with narrow loop detection
+                // Reference: PerimeterGenerator.cpp lines 976-996
+                const NARROW_LOOP_LENGTH_THRESHOLD: CoordF = 10.0; // mm (from BambuStudio)
+
+                for expoly in &current_area {
+                    // Test if this expolygon is too narrow for two normal-width lines
+                    // offset2: shrink by (width/2 + spacing_smaller/2), then grow by (spacing_smaller/2)
+                    let test_offset_shrink = self.config.external_perimeter_extrusion_width / 2.0
+                        + self.config.smaller_external_perimeter_spacing / 2.0;
+                    let test_offset_grow = self.config.smaller_external_perimeter_spacing / 2.0;
+
+                    let test_result = offset2(
+                        &[expoly.clone()],
+                        test_offset_shrink,
+                        test_offset_grow,
+                        self.config.join_type,
+                    );
+
+                    // Calculate area threshold for narrow loops
+                    let area_threshold = (self.config.external_perimeter_extrusion_width
+                        + self.config.smaller_external_perimeter_spacing)
+                        * NARROW_LOOP_LENGTH_THRESHOLD;
+
+                    if test_result.is_empty() && expoly.area().abs() < area_threshold {
+                        // This is a narrow loop - use smaller width
+                        let offset_smaller = self.config.smaller_external_perimeter_width / 2.0;
+                        let smaller_offset =
+                            shrink(&[expoly.clone()], offset_smaller, self.config.join_type);
+                        smaller_width_area.extend(smaller_offset);
+                    } else {
+                        // Normal loop - use regular external width
+                        let normal_offset =
+                            shrink(&[expoly.clone()], offset_distance, self.config.join_type);
+                        perimeter_area.extend(normal_offset);
+                    }
+                }
+
+                // FIX 1: Merge adjacent regions that may have been split by Clipper2
+                // This reduces fragmentation and brings us closer to Clipper1 behavior
+                if !perimeter_area.is_empty() {
+                    perimeter_area = self.merge_and_filter_regions(perimeter_area, min_spacing);
+                }
+                if !smaller_width_area.is_empty() {
+                    smaller_width_area =
+                        self.merge_and_filter_regions(smaller_width_area, min_spacing);
+                }
             } else {
                 // Internal perimeters: use offset2 (shrink then grow)
                 // This removes regions narrower than min_spacing before restoring perimeters
                 // shrink by (distance + min_spacing/2 - epsilon), then grow by (min_spacing/2 - epsilon)
                 let shrink_amount = offset_distance + min_spacing / 2.0 - 0.001;
                 let grow_amount = min_spacing / 2.0 - 0.001;
-                offset2(
+                perimeter_area = offset2(
                     &current_area,
                     shrink_amount,
                     grow_amount,
                     self.config.join_type,
-                )
-            };
+                );
+
+                // FIX 1: Merge adjacent regions that may have been split by Clipper2
+                if !perimeter_area.is_empty() {
+                    perimeter_area = self.merge_and_filter_regions(perimeter_area, min_spacing);
+                }
+            }
 
             // Detect gaps between previous and current perimeter levels
             if detect_gap_fill && perimeter_idx > 0 && !perimeter_area.is_empty() {
@@ -437,23 +592,47 @@ impl PerimeterGenerator {
                 }
             }
 
-            if perimeter_area.is_empty() {
+            if perimeter_area.is_empty() && smaller_width_area.is_empty() {
                 // No more room for perimeters
+                eprintln!(
+                    "[PERIMETER DEBUG] Breaking at iteration {} - no more area",
+                    perimeter_idx
+                );
                 break;
             }
 
-            // Extract perimeter loops from the offset result
+            eprintln!("[PERIMETER DEBUG] After offset: perimeter_area={} regions, smaller_width_area={} regions", 
+                perimeter_area.len(), smaller_width_area.len());
+
+            eprintln!(
+                "[PERIMETER DEBUG]   Iteration {} is_external={}",
+                perimeter_idx, is_external
+            );
+
+            // Extract perimeter loops from the normal-width offset result
+            // Select appropriate Flow object based on perimeter type
+            let flow_obj = if is_external {
+                Some(self.config.ext_perimeter_flow.clone())
+            } else {
+                Some(self.config.perimeter_flow.clone())
+            };
+
+            let mut normal_loop_count = 0;
+
             for expoly in &perimeter_area {
                 // Add contour as a perimeter
                 if !expoly.contour.is_empty() && self.is_valid_perimeter(&expoly.contour) {
-                    let loop_item = PerimeterLoop::new(
+                    let mut loop_item = PerimeterLoop::new_with_width_flag(
                         expoly.contour.clone(),
                         is_external,
                         true, // is_contour
                         perimeter_idx,
                         extrusion_width,
+                        false, // NOT smaller width
                     );
+                    loop_item.flow = flow_obj.clone();
                     perimeter_levels[perimeter_idx].push(loop_item);
+                    normal_loop_count += 1;
                 }
 
                 // Add holes as perimeters (they're inner boundaries)
@@ -463,19 +642,82 @@ impl PerimeterGenerator {
 
                 for hole in &sorted_holes {
                     if !hole.is_empty() && self.is_valid_perimeter(hole) {
-                        let loop_item = PerimeterLoop::new(
+                        let mut loop_item = PerimeterLoop::new_with_width_flag(
                             hole.clone(),
                             is_external,
                             false, // is_contour (it's a hole)
                             perimeter_idx,
                             extrusion_width,
+                            false, // NOT smaller width
                         );
+                        loop_item.flow = flow_obj.clone();
                         perimeter_levels[perimeter_idx].push(loop_item);
+                        normal_loop_count += 1;
                     }
                 }
             }
 
+            eprintln!(
+                "[PERIMETER DEBUG] Extracted {} normal-width loops from perimeter_area",
+                normal_loop_count
+            );
+
+            // Extract perimeter loops from the smaller-width offset result
+            if is_external {
+                let smaller_width = self.config.smaller_external_perimeter_width;
+                let smaller_flow = Some(self.config.smaller_ext_perimeter_flow.clone());
+
+                let mut smaller_loop_count = 0;
+
+                for expoly in &smaller_width_area {
+                    // Add contour as a perimeter with smaller width
+                    if !expoly.contour.is_empty() && self.is_valid_perimeter(&expoly.contour) {
+                        let mut loop_item = PerimeterLoop::new_with_width_flag(
+                            expoly.contour.clone(),
+                            is_external,
+                            true, // is_contour
+                            perimeter_idx,
+                            smaller_width,
+                            true, // IS smaller width
+                        );
+                        loop_item.flow = smaller_flow.clone();
+                        perimeter_levels[perimeter_idx].push(loop_item);
+                        smaller_loop_count += 1;
+                    }
+
+                    // Add holes as perimeters
+                    let mut sorted_holes = expoly.holes.clone();
+                    sorted_holes.sort_by(|a, b| Self::compare_polygons_deterministic(a, b));
+
+                    for hole in &sorted_holes {
+                        if !hole.is_empty() && self.is_valid_perimeter(hole) {
+                            let mut loop_item = PerimeterLoop::new_with_width_flag(
+                                hole.clone(),
+                                is_external,
+                                false, // is_contour (it's a hole)
+                                perimeter_idx,
+                                smaller_width,
+                                true, // IS smaller width
+                            );
+                            loop_item.flow = smaller_flow.clone();
+                            perimeter_levels[perimeter_idx].push(loop_item);
+                            smaller_loop_count += 1;
+                        }
+                    }
+                }
+
+                eprintln!(
+                    "[PERIMETER DEBUG] Extracted {} smaller-width loops from smaller_width_area",
+                    smaller_loop_count
+                );
+            }
+
             // Update current area for next iteration
+            // IMPORTANT: Only use perimeter_area for the next iteration!
+            // The smaller_width_area loops are terminal - they're too narrow to have
+            // internal perimeters inside them. This matches BambuStudio's behavior:
+            // `last = std::move(offsets);` (line 1120 in PerimeterGenerator.cpp)
+            // where only `offsets` (normal width) is used, NOT `offsets_with_smaller_width`.
             current_area = perimeter_area;
         }
 
@@ -492,6 +734,21 @@ impl PerimeterGenerator {
         // Order perimeters for printing
         // Default is inside-out (external perimeters last) unless configured otherwise
         // Sort each level deterministically before adding
+
+        // DEBUG: Count total loops
+        let total_loops: usize = perimeter_levels.iter().map(|level| level.len()).sum();
+        let internal_loops: usize = perimeter_levels
+            .iter()
+            .skip(1)
+            .map(|level| level.len())
+            .sum();
+        eprintln!(
+            "[PERIMETER DEBUG] Total loops generated: {} (external: {}, internal: {})",
+            total_loops,
+            perimeter_levels.get(0).map(|l| l.len()).unwrap_or(0),
+            internal_loops
+        );
+
         if self.config.external_perimeters_first {
             // Outside-in: start from perimeter 0 (external)
             for mut level in perimeter_levels {
@@ -598,22 +855,68 @@ impl PerimeterGenerator {
             // Compare by min X first
             match bb_a.min.x.cmp(&bb_b.min.x) {
                 std::cmp::Ordering::Equal => {}
-                other => return other,
+                ord => return ord,
             }
 
             // Then by min Y
             match bb_a.min.y.cmp(&bb_b.min.y) {
                 std::cmp::Ordering::Equal => {}
-                other => return other,
+                ord => return ord,
             }
 
-            // Finally by area (larger first for stability)
-            let area_a = a.area().abs();
-            let area_b = b.area().abs();
+            // Then by area (largest first)
+            let area_a = a.area();
+            let area_b = b.area();
             area_b
                 .partial_cmp(&area_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+    }
+
+    /// Reorder ExPolygons using nearest-neighbor (greedy traveling salesman).
+    /// This minimizes travel distance between surfaces.
+    /// Reference: libslic3r/ShortestPath.cpp `chain_expolygons()`
+    fn chain_expolygons(expolys: &[ExPolygon]) -> Vec<usize> {
+        if expolys.is_empty() {
+            return vec![];
+        }
+        if expolys.len() == 1 {
+            return vec![0];
+        }
+
+        // Extract bounding box centers for each expolygon
+        let centers: Vec<Point> = expolys.iter().map(|e| e.bounding_box().center()).collect();
+
+        // Greedy nearest-neighbor starting from first polygon
+        let mut ordered = Vec::with_capacity(expolys.len());
+        let mut visited = vec![false; expolys.len()];
+        let mut current_idx = 0;
+
+        ordered.push(current_idx);
+        visited[current_idx] = true;
+
+        for _ in 1..expolys.len() {
+            let current_pos = centers[current_idx];
+            let mut best_idx = 0;
+            let mut best_dist_sq = i128::MAX;
+
+            // Find nearest unvisited polygon
+            for (idx, &is_visited) in visited.iter().enumerate() {
+                if !is_visited {
+                    let dist_sq = current_pos.distance_squared(&centers[idx]);
+                    if dist_sq < best_dist_sq {
+                        best_dist_sq = dist_sq;
+                        best_idx = idx;
+                    }
+                }
+            }
+
+            ordered.push(best_idx);
+            visited[best_idx] = true;
+            current_idx = best_idx;
+        }
+
+        ordered
     }
 
     /// Compare two polygons deterministically for sorting.
@@ -660,6 +963,59 @@ impl PerimeterGenerator {
         }
 
         true
+    }
+
+    /// Merge adjacent regions and filter out small regions.
+    /// This fixes Clipper2's tendency to create more fragmented results than Clipper1.
+    ///
+    /// APPROACH B: Union with much more aggressive filtering
+    /// Union helps (905→836 loops), but need stronger filtering
+    fn merge_and_filter_regions(&self, regions: ExPolygons, min_spacing: CoordF) -> ExPolygons {
+        if regions.is_empty() {
+            return regions;
+        }
+
+        // VERY aggressive filtering before union
+        // Trying to eliminate as many Clipper2 artifacts as possible
+        let min_area_threshold = min_spacing * min_spacing * 5.0; // 5.0× spacing² (was 1.5×, then 3.0×)
+        let min_hole_area = min_spacing * min_spacing * 2.0; // 2.0× spacing² (was 0.75×, then 1.0×)
+
+        let filtered: Vec<ExPolygon> = regions
+            .into_iter()
+            .filter_map(|mut expoly| {
+                let contour_area = expoly.contour.area().abs();
+
+                // Filter out tiny contours very aggressively
+                if contour_area < min_area_threshold {
+                    return None;
+                }
+
+                // Filter out tiny holes very aggressively
+                expoly.holes.retain(|hole| {
+                    let hole_area = hole.area().abs();
+                    hole_area >= min_hole_area
+                });
+
+                Some(expoly)
+            })
+            .collect();
+
+        if filtered.is_empty() {
+            return Vec::new();
+        }
+
+        // Union to merge adjacent/overlapping regions
+        let mut all_polygons = Vec::new();
+        for expoly in &filtered {
+            all_polygons.push(expoly.contour.clone());
+            for hole in &expoly.holes {
+                let mut reversed_hole = hole.clone();
+                reversed_hole.reverse();
+                all_polygons.push(reversed_hole);
+            }
+        }
+
+        union_polygons_ex(&all_polygons)
     }
 
     /// Calculate the inset distance for getting to the infill boundary.
@@ -808,7 +1164,7 @@ mod tests {
     #[test]
     fn test_perimeter_config_spacing() {
         // Test that spacing is calculated correctly using Flow formula
-        let config = PerimeterConfig::new(0.45, 0.45, 0.2, 3);
+        let config = PerimeterConfig::new(0.45, 0.45, 0.2, 3, 0.4);
 
         // spacing = width - height × (1 - π/4) ≈ 0.45 - 0.2 × 0.2146 ≈ 0.407
         let expected_spacing = 0.45 - 0.2 * (1.0 - 0.25 * std::f64::consts::PI);

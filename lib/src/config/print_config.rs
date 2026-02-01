@@ -289,7 +289,7 @@ impl Default for PrintConfig {
             use_relative_e: true, // Match BambuStudio default (M83)
 
             // Arc Fitting
-            arc_fitting_enabled: false, // Disabled by default for compatibility
+            arc_fitting_enabled: false, // Disabled by default - causes classification issues
             arc_fitting_tolerance: 0.05, // 50 microns
             arc_fitting_min_radius: 0.5, // 0.5mm minimum
             arc_fitting_max_radius: 1000.0, // 1m maximum
@@ -471,7 +471,7 @@ impl Default for PrintObjectConfig {
         Self {
             layer_height: 0.2,
             perimeters: 3,
-            top_solid_layers: 4,
+            top_solid_layers: 3, // Changed from 4 to match BambuStudio reference
             bottom_solid_layers: 3,
             fill_density: 0.2,
             fill_pattern: InfillPattern::Grid,

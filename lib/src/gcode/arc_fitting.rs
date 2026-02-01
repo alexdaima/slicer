@@ -47,6 +47,12 @@ pub struct ArcFittingConfig {
     /// Arcs larger than this are split into multiple arcs.
     pub max_arc_angle: CoordF,
 
+    /// Arc length tolerance (percent).
+    /// The arc length must be within this percentage of the original polyline length.
+    /// BambuStudio uses 0.05 (5%). This prevents fitting arcs that have significantly
+    /// different lengths than the original path.
+    pub arc_length_tolerance_percent: CoordF,
+
     /// Whether arc fitting is enabled.
     pub enabled: bool,
 }
@@ -54,11 +60,12 @@ pub struct ArcFittingConfig {
 impl Default for ArcFittingConfig {
     fn default() -> Self {
         Self {
-            tolerance: 0.05,                           // 50 microns
-            min_radius: 0.5,                           // 0.5mm minimum
-            max_radius: 1000.0,                        // 1m maximum
-            min_points: 3,                             // Need at least 3 points to fit a circle
+            tolerance: 0.05,    // 50 microns (matches BambuStudio DEFAULT_SCALED_RESOLUTION)
+            min_radius: 0.5,    // 0.5mm minimum
+            max_radius: 2000.0, // 2000mm maximum (matches BambuStudio DEFAULT_SCALED_MAX_RADIUS)
+            min_points: 3,      // Need at least 3 points to fit a circle
             max_arc_angle: std::f64::consts::PI * 1.5, // 270 degrees max
+            arc_length_tolerance_percent: 0.05, // 5% (matches BambuStudio DEFAULT_ARC_LENGTH_PERCENT_TOLERANCE)
             enabled: true,
         }
     }
@@ -102,6 +109,7 @@ impl ArcFittingConfig {
             max_radius: 500.0,
             min_points: 4,
             max_arc_angle: std::f64::consts::PI,
+            arc_length_tolerance_percent: 0.02, // 2%
             enabled: true,
         }
     }
@@ -114,6 +122,7 @@ impl ArcFittingConfig {
             max_radius: 2000.0,
             min_points: 3,
             max_arc_angle: std::f64::consts::PI * 1.75,
+            arc_length_tolerance_percent: 0.1, // 10%
             enabled: true,
         }
     }
@@ -358,6 +367,9 @@ impl ArcFitter {
             return None;
         }
 
+        // Calculate the approximate length of the original polyline
+        let polyline_length = self.calculate_polyline_length(points);
+
         // Use three-point circle fitting
         // Pick first, middle, and last points
         let p1 = points[0];
@@ -418,6 +430,28 @@ impl ArcFitter {
 
         // Check angle bounds
         if angle > self.config.max_arc_angle {
+            return None;
+        }
+
+        // CRITICAL: Validate arc length matches polyline length (BambuStudio requirement)
+        // The arc length must be within arc_length_tolerance_percent of the original path
+        let arc_length = radius * angle;
+        let length_difference = (arc_length - polyline_length).abs() / polyline_length;
+
+        if length_difference >= self.config.arc_length_tolerance_percent {
+            // Arc length doesn't match - this could indicate wrong direction
+            // or that the points don't form a good arc
+            // Try the opposite direction (BambuStudio does this check)
+            let test_angle = (2.0 * std::f64::consts::PI - angle).abs();
+            let test_arc_length = radius * test_angle;
+            let test_difference = (test_arc_length - polyline_length).abs() / polyline_length;
+
+            if test_difference >= self.config.arc_length_tolerance_percent {
+                // Neither direction works - reject this arc
+                return None;
+            }
+            // Otherwise, we'd need to flip the direction, but this suggests
+            // the points don't form a good arc, so reject it
             return None;
         }
 
@@ -484,6 +518,22 @@ impl ArcFitter {
         }
 
         max_dev
+    }
+
+    /// Calculate the total length of a polyline (sum of segment lengths).
+    fn calculate_polyline_length(&self, points: &[PointF]) -> CoordF {
+        if points.len() < 2 {
+            return 0.0;
+        }
+
+        let mut total_length = 0.0;
+        for i in 0..points.len() - 1 {
+            let dx = points[i + 1].x - points[i].x;
+            let dy = points[i + 1].y - points[i].y;
+            total_length += (dx * dx + dy * dy).sqrt();
+        }
+
+        total_length
     }
 
     /// Validate that a fitted arc is within tolerance.

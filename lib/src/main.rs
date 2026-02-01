@@ -174,7 +174,7 @@ enum Commands {
         infill_density: u32,
 
         /// Pass threshold for quality score (0-100)
-        #[arg(long, default_value = "70")]
+        #[arg(long, default_value = "90")]
         pass_threshold: f64,
 
         /// Only compare without slicing (requires generated G-code path)
