@@ -385,6 +385,16 @@ pub struct PrintObjectConfig {
     /// Fuzzy skin point distance (mm).
     pub fuzzy_skin_point_distance: CoordF,
 
+    /// Enable wipe during retraction to reduce stringing.
+    pub wipe_enabled: bool,
+
+    /// Wipe distance (mm) - how far to move while wiping.
+    pub wipe_distance: CoordF,
+
+    /// Retract before wipe percentage (0-100).
+    /// How much of the retraction happens before vs during the wipe move.
+    pub retract_before_wipe: CoordF,
+
     /// Perimeter generation mode (Classic or Arachne).
     pub perimeter_mode: PerimeterMode,
 
@@ -482,6 +492,9 @@ impl Default for PrintObjectConfig {
             fuzzy_skin: false,
             fuzzy_skin_thickness: 0.3,
             fuzzy_skin_point_distance: 0.8,
+            wipe_enabled: true, // Enable wipe by default (matching BambuStudio)
+            wipe_distance: 2.0, // 2mm wipe distance
+            retract_before_wipe: 0.0, // 0% - do all retraction during wipe
             perimeter_mode: PerimeterMode::Classic,
             arachne_min_bead_width: 0.1,
             arachne_min_feature_size: 0.1,

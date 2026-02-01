@@ -424,6 +424,168 @@ fn convert_seam_position(pos: ConfigSeamPosition) -> SeamPosition {
     }
 }
 
+/// Wipe implementation for reducing stringing during retraction.
+///
+/// This stores the last extruded path and uses it to wipe the nozzle
+/// during retraction, following the path backwards while retracting filament.
+/// Reference: BambuStudio GCode.cpp Wipe class
+#[derive(Debug, Clone, Default)]
+struct Wipe {
+    /// Whether wiping is enabled.
+    enabled: bool,
+    /// The stored path for wiping (typically the last extruded path).
+    path: Vec<Point>,
+    /// Wipe distance in mm.
+    wipe_distance: f64,
+    /// Percentage of retraction to do before wiping (0-100).
+    retract_before_wipe_pct: f64,
+}
+
+impl Wipe {
+    /// Create a new Wipe with the given configuration.
+    fn new(enabled: bool, wipe_distance: f64, retract_before_wipe_pct: f64) -> Self {
+        Self {
+            enabled,
+            path: Vec::new(),
+            wipe_distance,
+            retract_before_wipe_pct: retract_before_wipe_pct.clamp(0.0, 100.0),
+        }
+    }
+
+    /// Store a path for potential wiping.
+    fn store_path(&mut self, points: &[Point]) {
+        if self.enabled {
+            self.path = points.to_vec();
+        }
+    }
+
+    /// Check if we have a valid path for wiping.
+    fn has_path(&self) -> bool {
+        self.enabled && !self.path.is_empty() && self.wipe_distance > 0.0
+    }
+
+    /// Reset the stored path.
+    fn reset_path(&mut self) {
+        self.path.clear();
+    }
+
+    /// Perform a wipe move during retraction.
+    ///
+    /// This follows the stored path backwards while retracting filament.
+    /// Returns true if a wipe was performed, false otherwise.
+    fn wipe(
+        &self,
+        writer: &mut GCodeWriter,
+        current_pos: Point,
+        total_retract_length: f64,
+        travel_speed: f64,
+    ) -> bool {
+        if !self.has_path() {
+            return false;
+        }
+
+        // Build wipe path: start from current position, go backwards along stored path
+        let mut wipe_path = Vec::new();
+        wipe_path.push(current_pos);
+
+        // Add points from the stored path in reverse order
+        for point in self.path.iter().rev() {
+            if *point != current_pos {
+                wipe_path.push(*point);
+            }
+        }
+
+        if wipe_path.len() < 2 {
+            return false;
+        }
+
+        // Calculate total wipe path length
+        let mut total_length = 0.0;
+        for i in 1..wipe_path.len() {
+            let dx = unscale(wipe_path[i].x - wipe_path[i - 1].x);
+            let dy = unscale(wipe_path[i].y - wipe_path[i - 1].y);
+            total_length += (dx * dx + dy * dy).sqrt();
+        }
+
+        if total_length < 0.001 {
+            return false;
+        }
+
+        // Clamp wipe distance to path length
+        let wipe_dist = self.wipe_distance.min(total_length);
+
+        // Trim the wipe path to the desired wipe distance
+        let mut trimmed_path = vec![wipe_path[0]];
+        let mut accumulated = 0.0;
+        for i in 1..wipe_path.len() {
+            let dx = unscale(wipe_path[i].x - wipe_path[i - 1].x);
+            let dy = unscale(wipe_path[i].y - wipe_path[i - 1].y);
+            let segment_len = (dx * dx + dy * dy).sqrt();
+
+            if accumulated + segment_len >= wipe_dist {
+                // Interpolate to exact wipe distance
+                let remaining = wipe_dist - accumulated;
+                let ratio = remaining / segment_len;
+                let new_x = wipe_path[i - 1].x
+                    + ((wipe_path[i].x - wipe_path[i - 1].x) as f64 * ratio) as i64;
+                let new_y = wipe_path[i - 1].y
+                    + ((wipe_path[i].y - wipe_path[i - 1].y) as f64 * ratio) as i64;
+                trimmed_path.push(Point::new(new_x, new_y));
+                break;
+            } else {
+                trimmed_path.push(wipe_path[i]);
+                accumulated += segment_len;
+            }
+        }
+
+        if trimmed_path.len() < 2 {
+            return false;
+        }
+
+        // Calculate how much to retract during the wipe
+        // Portion of retraction to do during wipe (after retract_before_wipe)
+        let retract_during_wipe =
+            total_retract_length * (1.0 - self.retract_before_wipe_pct / 100.0);
+
+        if retract_during_wipe <= 0.0 {
+            return false;
+        }
+
+        // Calculate accumulated length for E distribution
+        let mut segment_lengths = Vec::new();
+        let mut total_wipe_len = 0.0;
+        for i in 1..trimmed_path.len() {
+            let dx = unscale(trimmed_path[i].x - trimmed_path[i - 1].x);
+            let dy = unscale(trimmed_path[i].y - trimmed_path[i - 1].y);
+            let len = (dx * dx + dy * dy).sqrt();
+            segment_lengths.push(len);
+            total_wipe_len += len;
+        }
+
+        // Write wipe comment
+        writer.write_raw("; WIPE");
+
+        // Move along wipe path while retracting
+        for i in 1..trimmed_path.len() {
+            let segment_ratio = segment_lengths[i - 1] / total_wipe_len;
+            let segment_retract = retract_during_wipe * segment_ratio * 0.95; // Slightly less to avoid over-retraction
+
+            let e_value = -segment_retract; // Negative for retraction
+            let point = &trimmed_path[i];
+
+            // Use extrude_to with negative E for retraction during wipe
+            writer.extrude_to(
+                unscale(point.x),
+                unscale(point.y),
+                e_value,
+                Some(travel_speed * 60.0),
+            );
+        }
+
+        true
+    }
+}
+
 /// The main printing pipeline that orchestrates the complete slicing process.
 pub struct PrintPipeline {
     /// Pipeline configuration.
@@ -434,6 +596,8 @@ pub struct PrintPipeline {
     support_generator: Option<SupportGenerator>,
     /// Travel planner for avoid crossing perimeters.
     travel_planner: Option<AvoidCrossingPerimeters>,
+    /// Wipe handler for reducing stringing during retraction.
+    wipe: Wipe,
 }
 
 impl PrintPipeline {
@@ -454,11 +618,20 @@ impl PrintPipeline {
         } else {
             None
         };
+
+        // Initialize wipe with configuration
+        let wipe = Wipe::new(
+            config.object.wipe_enabled,
+            config.object.wipe_distance,
+            config.object.retract_before_wipe,
+        );
+
         Self {
             config,
             arc_fitter,
             support_generator,
             travel_planner,
+            wipe,
         }
     }
 
@@ -1388,25 +1561,23 @@ impl PrintPipeline {
         }
 
         // Generate sparse infill for internal regions
+        // BambuStudio: Only generate sparse infill in regions explicitly marked as Internal surface type,
+        // intersected with the infill area (inside perimeters) and excluding solid regions.
+        // This prevents double-counting areas that would be covered by both solid and sparse infill.
         if !sparse_regions.is_empty() && base_config.density > 0.0 && base_config.density < 1.0 {
-            // Intersect sparse regions with actual infill area
-            let sparse_infill_area = clipper::intersection(&infill_expolygons, &sparse_regions);
-
-            // Also include any infill area not covered by solid regions
+            // Get the infill area excluding solid regions (solid infill already generated above)
             let remaining_area = if !solid_regions.is_empty() {
                 clipper::difference(&infill_expolygons, &solid_regions)
             } else {
                 infill_expolygons.clone()
             };
 
-            // Combine sparse regions with remaining area
-            let all_sparse: ExPolygons = sparse_infill_area
-                .into_iter()
-                .chain(remaining_area.into_iter())
-                .collect();
+            // Intersect remaining area with sparse regions to get actual sparse infill area
+            // This ensures we only fill areas designated as Internal surface type
+            let sparse_infill_area = clipper::intersection(&remaining_area, &sparse_regions);
 
             // Union to merge overlapping regions
-            let merged_sparse = clipper::union_ex(&all_sparse);
+            let merged_sparse = clipper::union_ex(&sparse_infill_area);
 
             if !merged_sparse.is_empty() {
                 let mut sparse_config = base_config.clone();
@@ -1636,19 +1807,39 @@ impl PrintPipeline {
                     };
 
                     if travel_dist > retract_before_travel {
-                        writer.retract();
+                        // Try to perform a wipe move for support paths too
+                        let current_pos = match last_end {
+                            Some(pos) => pos,
+                            None => path_start,
+                        };
+
+                        let total_retract = self.config.print.retract_length;
+                        let travel_speed = self.config.print.travel_speed;
+                        let wiped =
+                            self.wipe
+                                .wipe(writer, current_pos, total_retract, travel_speed);
+
+                        if !wiped {
+                            writer.retract();
+                        }
                     }
 
                     // Use travel planner if available
                     self.emit_travel(writer, last_end, path_start);
 
                     writer.unretract();
+                    self.wipe.reset_path();
                 }
 
                 // Extrude support path (use slower speed for support)
                 self.extrude_path(writer, path, layer_paths.layer_height, is_first_layer)?;
 
                 last_end = path.points.last().copied();
+
+                // Store support path for wiping
+                let path_points: Vec<Point> =
+                    path.points.iter().map(|p| Point::new(p.x, p.y)).collect();
+                self.wipe.store_path(&path_points);
             }
         }
 
@@ -1687,14 +1878,44 @@ impl PrintPipeline {
                 };
 
                 if travel_dist > retract_before_travel {
-                    writer.retract();
+                    // Try to perform a wipe move, fall back to normal retraction if not possible
+                    let current_pos = match last_end {
+                        Some(pos) => pos,
+                        None => path_start, // Shouldn't happen in practice
+                    };
+
+                    // Perform partial retraction before wipe (if configured)
+                    let total_retract = self.config.print.retract_length;
+                    let retract_before =
+                        total_retract * (self.config.object.retract_before_wipe / 100.0);
+
+                    if retract_before > 0.0 {
+                        // Do partial retraction before wipe
+                        // Note: writer.retract() does full retraction, so we'd need to modify this
+                        // For now, skip pre-retraction and do it all during wipe
+                    }
+
+                    // Try wipe - if it succeeds, it handles the retraction during movement
+                    // If it fails, do normal retraction
+                    let travel_speed = self.config.print.travel_speed;
+                    let wiped = self
+                        .wipe
+                        .wipe(writer, current_pos, total_retract, travel_speed);
+
+                    if !wiped {
+                        // Normal retraction if wipe wasn't possible
+                        writer.retract();
+                    }
                 }
 
                 // Use travel planner if available
                 self.emit_travel(writer, last_end, path_start);
 
-                // Unretract if we retracted
+                // Unretract (whether we did normal retract or wipe)
                 writer.unretract();
+
+                // Reset wipe path after travel
+                self.wipe.reset_path();
             }
 
             // Extrude along path
@@ -1702,6 +1923,12 @@ impl PrintPipeline {
 
             // Remember end position
             last_end = path.points.last().copied();
+
+            // Store path for potential wiping during next retraction
+            // Convert path points to Points for wipe storage
+            let path_points: Vec<Point> =
+                path.points.iter().map(|p| Point::new(p.x, p.y)).collect();
+            self.wipe.store_path(&path_points);
         }
 
         Ok(())

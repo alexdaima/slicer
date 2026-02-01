@@ -397,13 +397,15 @@ impl PerimeterGenerator {
                 self.config.perimeter_spacing
             };
 
-            // Use offset2 for internal perimeters to enable proper gap detection
-            // This removes narrow protrusions that would cause gaps
-            let perimeter_area = if perimeter_idx == 0 || !detect_gap_fill {
-                // External perimeter or gap fill disabled: simple shrink
+            // BambuStudio: For internal perimeters, ALWAYS use offset2 (thin wall strategy)
+            // to remove narrow protrusions that would cause over-filling.
+            // This applies regardless of whether gap fill detection is enabled.
+            let perimeter_area = if perimeter_idx == 0 {
+                // External perimeter: simple shrink by half width from edge
                 shrink(&current_area, offset_distance, self.config.join_type)
             } else {
-                // Internal perimeters with gap fill: use offset2 to clean up
+                // Internal perimeters: use offset2 (shrink then grow)
+                // This removes regions narrower than min_spacing before restoring perimeters
                 // shrink by (distance + min_spacing/2 - epsilon), then grow by (min_spacing/2 - epsilon)
                 let shrink_amount = offset_distance + min_spacing / 2.0 - 0.001;
                 let grow_amount = min_spacing / 2.0 - 0.001;
